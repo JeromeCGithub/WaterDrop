@@ -1,0 +1,7 @@
+[package]
+name = "waterdrop-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+waterdrop-core = { path = "../waterdrop-core" }

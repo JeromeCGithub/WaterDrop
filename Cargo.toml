@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "waterdrop-cli",
+    "waterdrop-core",
+    "waterdrop-engine",
+]
+resolver = "3"
