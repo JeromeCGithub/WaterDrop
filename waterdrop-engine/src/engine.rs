@@ -68,6 +68,8 @@ impl Engine {
 
             loop {
                 tokio::select! {
+                    biased;
+
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(EngineCmd::StartAccepting { addr }) => {
@@ -105,11 +107,12 @@ impl Engine {
                         if let Some(l) = listener.as_mut() {
                             l.accept().await
                         } else {
+                            // Precondition guard prevents this branch, but
+                            // we still need a fallback for the type system.
                             std::future::pending().await
                         }
-                    } => {
-                        let conn: anyhow::Result<<F::L as Listener>::Conn> = result;
-                        match conn {
+                    }, if listener.is_some() => {
+                        match result {
                             Ok(c) => {
                                 let peer = Connection::peer(&c);
                                 info!(peer = %peer, "Connection accepted");
