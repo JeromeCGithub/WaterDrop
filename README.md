@@ -1,10 +1,12 @@
 # WaterDrop
 
+> ⚠️ **This project is in early implementation and is not functional yet.** The foundational infrastructure (transport, engine, logging) is in place, but the protocol, authentication, pairing, and file transfer are not implemented. You cannot transfer files with WaterDrop today.
+
 A LAN / Tailscale file drop tool (AirDrop-like) for **Linux**, **Android**, and **Windows**.
 
 Send files quickly to a trusted device on your local network or over Tailscale — no cloud, no accounts, no fuss.
 
-## Features
+## Planned Features
 
 - **Fast local transfers** over TCP on LAN or Tailscale
 - **Device pairing** as the security model (code-based or NAS password)
@@ -15,28 +17,9 @@ Send files quickly to a trusted device on your local network or over Tailscale �
 
 ## Project Status
 
-> **Early development** — the transport layer, engine orchestration, and structured logging are in place. The protocol (authentication, pairing, file transfer) is designed but not yet implemented.
+**Stage: scaffolding / infrastructure only — not functional.**
 
-### What's implemented
-
-- Cargo workspace with `waterdrop-core`, `waterdrop-engine`, and `waterdrop-cli`
-- Transport abstraction traits (`Connection`, `Listener`, `ListenerFactory`) in `waterdrop-core`
-- Concrete TCP transport (`TcpConnection`, `TcpListener`, `TcpListenerFactory`) in `waterdrop-engine`
-- Async engine with command / event model (`EngineCmd` / `EngineEvent`) using `tokio::select!`
-- `SessionHandler` trait for pluggable connection handling
-- Structured logging with [`tracing`](https://docs.rs/tracing) and `RUST_LOG` support
-- Workspace-wide Clippy enforcement (`clippy::all` + `clippy::pedantic` at deny level)
-- Tests for engine orchestration and TCP transport (9 tests)
-
-### What's next
-
-- [ ] Protocol v1 implementation (frame parsing, message types)
-- [ ] Ed25519 identity and authentication handshake
-- [ ] Device pairing (code + NAS password)
-- [ ] File transfer (offer → accept/deny → stream → finalize)
-- [ ] Desktop UI with Dioxus (`waterdrop-app`)
-- [ ] Android client
-- [ ] CI pipeline (GitHub Actions)
+The project has a working async engine that can accept TCP connections and dispatch them to a session handler, but no protocol logic exists yet. Connecting to the server (e.g. via telnet) will result in an immediate disconnect because the session handler is a placeholder.
 
 ## Architecture
 
@@ -77,53 +60,11 @@ cargo run --bin waterdrop-cli
 
 The CLI starts the engine, binds a TCP listener on `127.0.0.1:9000`, and waits for connections. Press **Ctrl+C** to shut down gracefully.
 
-### Logging
-
-WaterDrop uses [`tracing`](https://docs.rs/tracing) with an `EnvFilter`. Control verbosity via `RUST_LOG`:
-
-```sh
-# Default (info)
-cargo run --bin waterdrop-cli
-
-# Debug — includes engine loop internals
-RUST_LOG=debug cargo run --bin waterdrop-cli
-
-# Trace — maximum verbosity
-RUST_LOG=trace cargo run --bin waterdrop-cli
-
-# Filter by crate
-RUST_LOG=waterdrop_engine=debug,waterdrop_cli=info cargo run --bin waterdrop-cli
-```
-
 ### Test
 
 ```sh
 cargo test --workspace
 ```
-
-### Lint
-
-```sh
-cargo clippy --workspace
-```
-
-The workspace enforces `clippy::all` and `clippy::pedantic` at the `deny` level, and `unsafe_code` is forbidden. See the root [`Cargo.toml`](Cargo.toml) for the full lint configuration.
-
-## Quick Test with Telnet
-
-Start the CLI in one terminal:
-
-```sh
-RUST_LOG=debug cargo run --bin waterdrop-cli
-```
-
-Connect from another:
-
-```sh
-telnet 127.0.0.1 9000
-```
-
-You should see the connection accepted in the engine logs. The connection closes immediately because the current session handler is a placeholder that only logs the peer address — the actual protocol is not yet implemented.
 
 ## Documentation
 
