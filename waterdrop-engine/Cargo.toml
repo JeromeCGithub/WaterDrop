@@ -3,6 +3,11 @@ name = "waterdrop-engine"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 waterdrop-core = { path = "../waterdrop-core" }
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1.0"

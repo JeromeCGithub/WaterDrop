@@ -18,3 +18,5 @@
 //!
 //! - **Filesystem helpers** — filename sanitisation, temp-file write with atomic
 //!   rename, and collision rename strategy (e.g. `file (1).ext`).
+
+pub mod listener;
