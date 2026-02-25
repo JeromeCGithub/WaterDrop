@@ -14,5 +14,6 @@
 //!   CLI loggers or UI subscribers
 
 pub mod engine;
+pub mod message_processor;
 pub mod session;
 pub mod tcp;
