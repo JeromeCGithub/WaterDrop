@@ -20,3 +20,4 @@
 //!   rename, and collision rename strategy (e.g. `file (1).ext`).
 
 pub mod listener;
+pub mod protocol;
