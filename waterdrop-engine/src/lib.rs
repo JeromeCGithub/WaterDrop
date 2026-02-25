@@ -15,5 +15,6 @@
 
 pub mod engine;
 pub mod message_processor;
+pub mod quic;
 pub mod session;
 pub mod tcp;
