@@ -40,7 +40,6 @@ impl<C: Connection> SessionHandler<C> for ConcreteSessionHandler {
                     Ok(n) => {
                         accum.extend_from_slice(&buf[..n]);
 
-                        // Drain all complete frames from the accumulation buffer.
                         loop {
                             match try_decode_frame(&mut accum) {
                                 Ok(Some(frame)) => {
@@ -49,16 +48,8 @@ impl<C: Connection> SessionHandler<C> for ConcreteSessionHandler {
                                         return;
                                     }
                                 }
-                                Ok(None) => {
-                                    // Incomplete frame — not enough data yet.
-                                    // Leave the bytes in accum and wait for the
-                                    // next read to bring more.
-                                    break;
-                                }
+                                Ok(None) => break,
                                 Err(e) => {
-                                    // Protocol violation (bad magic, unsupported
-                                    // version, unknown type, oversized payload).
-                                    // The connection is in an unrecoverable state.
                                     warn!(peer = %peer, error = %e, "Protocol error, closing connection");
                                     // TODO: send ERROR frame back before closing
                                     return;
