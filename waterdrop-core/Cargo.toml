@@ -10,3 +10,4 @@ workspace = true
 anyhow = "1.0"
 tracing = "0.1"
 bytes = "1.0"
+rcgen = "0.13"
