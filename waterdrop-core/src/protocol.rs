@@ -81,6 +81,16 @@ pub struct Frame {
 ///   should read more data and try again.
 /// * `Err(..)` — protocol violation (bad magic, unsupported version, unknown
 ///   message type, oversized payload).  The caller should close the connection.
+///
+/// # Errors
+///
+/// Returns an error on protocol violations: bad magic, unsupported version,
+/// unknown message type, or payload exceeding [`MAX_PAYLOAD_LEN`].
+///
+/// # Panics
+///
+/// Cannot panic. The `expect` calls on slice conversions are guarded by the
+/// `HEADER_LEN` check at the top of the function.
 pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>> {
     if buf.len() < HEADER_LEN {
         return Ok(None);
@@ -96,10 +106,19 @@ pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>> {
 
     let msg_type = MessageType::try_from(buf[OFF_TYPE])?;
 
-    let flags = u16::from_be_bytes(buf[OFF_FLAGS..OFF_FLAGS + 2].try_into().unwrap());
+    // These slices are exactly 2 and 4 bytes respectively (guaranteed by
+    // the HEADER_LEN check above), so the conversions cannot fail.
+    let flags = u16::from_be_bytes(
+        buf[OFF_FLAGS..OFF_FLAGS + 2]
+            .try_into()
+            .expect("flags slice is exactly 2 bytes"),
+    );
 
-    let payload_len =
-        u32::from_be_bytes(buf[OFF_LENGTH..OFF_LENGTH + 4].try_into().unwrap()) as usize;
+    let payload_len = u32::from_be_bytes(
+        buf[OFF_LENGTH..OFF_LENGTH + 4]
+            .try_into()
+            .expect("length slice is exactly 4 bytes"),
+    ) as usize;
 
     ensure!(
         payload_len <= MAX_PAYLOAD_LEN,
@@ -117,6 +136,7 @@ pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>> {
         version,
         msg_type,
         flags,
+        #[allow(clippy::cast_possible_truncation)] // guarded by MAX_PAYLOAD_LEN (fits in u32)
         payload_length: payload_len as u32,
     };
 
@@ -125,19 +145,20 @@ pub fn try_decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>> {
 
 /// Encodes a frame into `buf`.
 ///
-/// This appends the 13-byte header followed by `payload` to the buffer, which
-/// can then be flushed to the connection with `write_all`.
+/// Appends the 13-byte header followed by `payload` to the buffer.
 pub fn encode_frame(msg_type: MessageType, payload: &[u8], buf: &mut BytesMut) {
     buf.reserve(HEADER_LEN + payload.len());
     buf.put_slice(MAGIC);
     buf.put_u8(VERSION);
     buf.put_u8(msg_type.into());
-    buf.put_u16(0x0000); // flags — reserved in v1
+    buf.put_u16(0x0000);
+    #[allow(clippy::cast_possible_truncation)] // frame payloads are bounded by MAX_PAYLOAD_LEN
     buf.put_u32(payload.len() as u32);
     buf.put_slice(payload);
 }
 
 /// Convenience wrapper that allocates and returns a new `BytesMut`.
+#[must_use]
 pub fn encode_frame_to_bytes(msg_type: MessageType, payload: &[u8]) -> BytesMut {
     let mut buf = BytesMut::with_capacity(HEADER_LEN + payload.len());
     encode_frame(msg_type, payload, &mut buf);
