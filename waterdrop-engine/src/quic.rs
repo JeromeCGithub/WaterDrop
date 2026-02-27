@@ -4,7 +4,7 @@ use anyhow::Context;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use tracing::{debug, info};
 
-use waterdrop_core::listener::{Connection, DataStream, Listener, ListenerFactory};
+use waterdrop_core::transport::{Connection, DataStream, Listener, ListenerFactory};
 use waterdrop_core::tls;
 
 const ALPN_PROTOCOL: &[u8] = b"waterdrop/1";

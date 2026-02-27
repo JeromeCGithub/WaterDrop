@@ -14,7 +14,7 @@ async fn emit(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     }
 }
 
-use waterdrop_core::listener::{Connection, DataStream};
+use waterdrop_core::transport::{Connection, DataStream};
 use waterdrop_core::protocol::{
     self, HelloAckPayload, HelloPayload, MessageType, TransferDecisionPayload, TransferDonePayload,
     TransferOfferPayload, decode_payload, encode_payload_frame, try_decode_frame,
@@ -771,7 +771,7 @@ mod tests {
     use anyhow::Result;
     use tokio::sync::mpsc;
 
-    use waterdrop_core::listener::{Connection, DataStream};
+    use waterdrop_core::transport::{Connection, DataStream};
     use waterdrop_core::protocol::{
         HelloAckPayload, MessageType, TransferOfferPayload, encode_payload_frame, try_decode_frame,
     };

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use waterdrop_core::listener::{Connection, Connector, Listener, ListenerFactory};
+use waterdrop_core::transport::{Connection, Connector, Listener, ListenerFactory};
 
 use crate::session::{Role, SendRequest, Session, SessionCmd, SessionEvent};
 

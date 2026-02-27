@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{debug, info, warn};
 
-use waterdrop_core::listener::{Connection, Connector, DataStream, Listener, ListenerFactory};
+use waterdrop_core::transport::{Connection, Connector, DataStream, Listener, ListenerFactory};
 
 /// A yamux sub-stream used for bulk data transfer over TCP.
 ///
@@ -363,7 +363,7 @@ impl Connector for TcpConnector {
 
 #[cfg(test)]
 mod tests {
-    use waterdrop_core::listener::DataStream as _;
+    use waterdrop_core::transport::DataStream as _;
 
     use super::*;
 
