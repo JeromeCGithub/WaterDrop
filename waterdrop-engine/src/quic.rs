@@ -4,10 +4,54 @@ use anyhow::Context;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use tracing::{debug, info};
 
-use waterdrop_core::listener::{Connection, Listener, ListenerFactory};
+use waterdrop_core::listener::{Connection, DataStream, Listener, ListenerFactory};
 use waterdrop_core::tls;
 
 const ALPN_PROTOCOL: &[u8] = b"waterdrop/1";
+
+/// A bidirectional QUIC sub-stream used for bulk data transfer.
+///
+/// Wraps a pair of [`quinn::SendStream`] and [`quinn::RecvStream`] opened
+/// via [`QuicConnection::open_stream`] or [`QuicConnection::accept_stream`].
+pub struct QuicDataStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl DataStream for QuicDataStream {
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = anyhow::Result<usize>> + Send + 'a {
+        async move {
+            self.recv
+                .read(buf)
+                .await
+                .context("failed to read from QUIC data stream")?
+                .map_or(Ok(0), Ok)
+        }
+    }
+
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
+        async move {
+            self.send
+                .write_all(buf)
+                .await
+                .context("failed to write to QUIC data stream")
+        }
+    }
+
+    fn shutdown(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send + '_ {
+        async move {
+            self.send
+                .finish()
+                .context("failed to finish QUIC data stream")
+        }
+    }
+}
 
 /// A QUIC connection backed by a single bi-directional stream.
 ///
@@ -16,8 +60,14 @@ const ALPN_PROTOCOL: &[u8] = b"waterdrop/1";
 /// [`write_all`](Connection::write_all), not during
 /// [`accept`](QuicListener::accept).  This mirrors TCP where `accept()`
 /// returns as soon as the handshake completes.
+///
+/// Additional data streams can be opened via [`open_stream`](Connection::open_stream)
+/// or accepted via [`accept_stream`](Connection::accept_stream).  These are
+/// independent of the control channel and can be shut down or dropped
+/// without affecting control traffic.
 pub struct QuicConnection {
     connection: quinn::Connection,
+
     send: Option<quinn::SendStream>,
     recv: Option<quinn::RecvStream>,
     peer_addr: String,
@@ -39,6 +89,8 @@ impl QuicConnection {
 }
 
 impl Connection for QuicConnection {
+    type DataStream = QuicDataStream;
+
     fn peer(&self) -> String {
         self.peer_addr.clone()
     }
@@ -81,6 +133,34 @@ impl Connection for QuicConnection {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    fn open_stream(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<Self::DataStream>> + Send + '_ {
+        async move {
+            self.ensure_streams().await?;
+            let (send, recv) = self
+                .connection
+                .open_bi()
+                .await
+                .context("failed to open QUIC data stream")?;
+            Ok(QuicDataStream { send, recv })
+        }
+    }
+
+    fn accept_stream(
+        &mut self,
+    ) -> impl Future<Output = anyhow::Result<Self::DataStream>> + Send + '_ {
+        async move {
+            self.ensure_streams().await?;
+            let (send, recv) = self
+                .connection
+                .accept_bi()
+                .await
+                .context("failed to accept QUIC data stream")?;
+            Ok(QuicDataStream { send, recv })
         }
     }
 }
@@ -408,6 +488,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::similar_names)]
     async fn given_two_clients_when_accepted_then_peers_are_distinct() {
         let factory = QuicListenerFactory::new().unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
@@ -448,6 +529,7 @@ mod tests {
 
         let client_endpoint = make_client_endpoint().unwrap();
 
+        #[allow(clippy::cast_sign_loss)]
         let payload: Vec<u8> = (0..131_072).map(|i| (i % 251) as u8).collect();
         let payload_clone = payload.clone();
 
@@ -515,5 +597,183 @@ mod tests {
 
         let client_received = client_handle.await.unwrap();
         assert_eq!(client_received, "pong");
+    }
+
+    // ── Data-stream tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn given_client_opens_data_stream_when_server_accepts_then_data_flows() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+
+        let client_endpoint = make_client_endpoint().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let connection = client_endpoint
+                .connect(addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+
+            // Open the control stream first (stream 0).
+            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
+            ctrl_send.write_all(b"hello").await.unwrap();
+
+            // Open a second stream for data (stream 1).
+            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
+            data_send.write_all(b"file-data-abc").await.unwrap();
+            data_send.finish().unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+
+        let mut server_conn = listener.accept().await.unwrap();
+
+        // Read from control channel.
+        let mut buf = [0u8; 64];
+        let n = server_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+
+        // Accept data stream.
+        let mut data_stream = server_conn.accept_stream().await.unwrap();
+        let mut data_buf = [0u8; 64];
+        let n = data_stream.read(&mut data_buf).await.unwrap();
+        assert_eq!(&data_buf[..n], b"file-data-abc");
+
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_server_opens_data_stream_when_client_accepts_then_data_flows() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+
+        let client_endpoint = make_client_endpoint().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let connection = client_endpoint
+                .connect(addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+
+            // Open the control stream (stream 0).
+            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
+            ctrl_send.write_all(b"ctrl").await.unwrap();
+
+            // Accept data stream opened by server.
+            let (_, mut data_recv) = connection.accept_bi().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = data_recv.read(&mut buf).await.unwrap().unwrap_or(0);
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let mut server_conn = listener.accept().await.unwrap();
+
+        // Read from control channel.
+        let mut buf = [0u8; 64];
+        let n = server_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ctrl");
+
+        // Server opens a data stream.
+        let mut data_stream = server_conn.open_stream().await.unwrap();
+        data_stream.write_all(b"server-data").await.unwrap();
+        data_stream.shutdown().await.unwrap();
+
+        let client_received = client_handle.await.unwrap();
+        assert_eq!(client_received, "server-data");
+    }
+
+    #[tokio::test]
+    async fn given_large_payload_on_data_stream_when_received_then_data_is_intact() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+
+        let client_endpoint = make_client_endpoint().unwrap();
+
+        let payload: Vec<u8> = (0u32..131_072).map(|i| (i % 251) as u8).collect();
+        let payload_clone = payload.clone();
+
+        let client_handle = tokio::spawn(async move {
+            let connection = client_endpoint
+                .connect(addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+
+            // Control stream first.
+            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
+            ctrl_send.write_all(b"go").await.unwrap();
+
+            // Data stream with large payload.
+            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
+            data_send.write_all(&payload_clone).await.unwrap();
+            data_send.finish().unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+
+        let mut server_conn = listener.accept().await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let _n = server_conn.read(&mut buf).await.unwrap();
+
+        let mut data_stream = server_conn.accept_stream().await.unwrap();
+        let mut received = Vec::new();
+        let mut data_buf = [0u8; 4096];
+        loop {
+            let n = data_stream.read(&mut data_buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&data_buf[..n]);
+        }
+
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_data_stream_closed_when_read_then_returns_zero() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+
+        let client_endpoint = make_client_endpoint().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let connection = client_endpoint
+                .connect(addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+
+            // Control stream.
+            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
+            ctrl_send.write_all(b"hi").await.unwrap();
+
+            // Data stream — finish immediately.
+            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
+            data_send.finish().unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let mut server_conn = listener.accept().await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let _n = server_conn.read(&mut buf).await.unwrap();
+
+        let mut data_stream = server_conn.accept_stream().await.unwrap();
+        let mut data_buf = [0u8; 64];
+        let n = data_stream.read(&mut data_buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        client_handle.await.unwrap();
     }
 }
