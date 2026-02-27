@@ -4,10 +4,22 @@ use anyhow::Context;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use tracing::{debug, info};
 
-use waterdrop_core::transport::{Connection, DataStream, Listener, ListenerFactory};
 use waterdrop_core::tls;
+use waterdrop_core::transport::{Connection, Connector, DataStream, Listener, ListenerFactory};
 
 const ALPN_PROTOCOL: &[u8] = b"waterdrop/1";
+
+/// Whether this side of the QUIC connection initiated (client) or
+/// accepted (server) the connection.
+///
+/// This determines how the **control channel** is established:
+/// - **Client** — opens the first bi-directional stream (`open_bi`).
+/// - **Server** — accepts the first bi-directional stream (`accept_bi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicMode {
+    Client,
+    Server,
+}
 
 /// A bidirectional QUIC sub-stream used for bulk data transfer.
 ///
@@ -67,7 +79,11 @@ impl DataStream for QuicDataStream {
 /// without affecting control traffic.
 pub struct QuicConnection {
     connection: quinn::Connection,
-
+    mode: QuicMode,
+    /// Keeps the client-side endpoint alive for the lifetime of the
+    /// connection.  Server-side connections set this to `None` because
+    /// the [`QuicListener`] already owns the endpoint.
+    _endpoint: Option<quinn::Endpoint>,
     send: Option<quinn::SendStream>,
     recv: Option<quinn::RecvStream>,
     peer_addr: String,
@@ -76,11 +92,18 @@ pub struct QuicConnection {
 impl QuicConnection {
     async fn ensure_streams(&mut self) -> anyhow::Result<()> {
         if self.send.is_none() {
-            let (send, recv) = self
-                .connection
-                .accept_bi()
-                .await
-                .context("failed to accept bi-directional QUIC stream")?;
+            let (send, recv) = match self.mode {
+                QuicMode::Client => self
+                    .connection
+                    .open_bi()
+                    .await
+                    .context("failed to open bi-directional QUIC stream (client)")?,
+                QuicMode::Server => self
+                    .connection
+                    .accept_bi()
+                    .await
+                    .context("failed to accept bi-directional QUIC stream (server)")?,
+            };
             self.send = Some(send);
             self.recv = Some(recv);
         }
@@ -195,6 +218,8 @@ impl Listener for QuicListener {
 
             Ok(QuicConnection {
                 connection,
+                mode: QuicMode::Server,
+                _endpoint: None,
                 send: None,
                 recv: None,
                 peer_addr,
@@ -249,6 +274,69 @@ impl ListenerFactory for QuicListenerFactory {
                 local_addr,
             })
         }
+    }
+}
+
+// ── Outbound (client) connections ───────────────────────────────────
+
+/// Creates a QUIC client connection to the given address.
+///
+/// Returns a [`QuicConnection`] in [`QuicMode::Client`], ready for use
+/// with the [`Connection`] trait.  The control channel stream is lazily
+/// opened on the first read/write call.
+///
+/// # Errors
+///
+/// Returns an error if the address cannot be parsed, the client endpoint
+/// cannot be created, or the QUIC handshake fails.
+pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid connect address: {addr}"))?;
+
+    let bind_addr: std::net::SocketAddr = "0.0.0.0:0"
+        .parse()
+        .context("failed to parse ephemeral bind address")?;
+    let mut endpoint =
+        quinn::Endpoint::client(bind_addr).context("failed to create QUIC client endpoint")?;
+    endpoint.set_default_client_config(insecure_client_config()?);
+
+    let connection = endpoint
+        .connect(socket_addr, "localhost")
+        .with_context(|| format!("failed to start QUIC connection to {addr}"))?
+        .await
+        .with_context(|| format!("QUIC handshake failed with {addr}"))?;
+
+    let peer_addr = connection.remote_address().to_string();
+    debug!(peer = %peer_addr, "QUIC client connected");
+
+    Ok(QuicConnection {
+        connection,
+        mode: QuicMode::Client,
+        _endpoint: Some(endpoint),
+        send: None,
+        recv: None,
+        peer_addr,
+    })
+}
+
+/// Factory that creates outbound [`QuicConnection`]s (client side).
+///
+/// This is the client-mode counterpart to [`QuicListenerFactory`].
+/// A fresh ephemeral endpoint is created for each connection with an
+/// insecure TLS configuration (server certificate verification is
+/// skipped because authentication happens at the WaterDrop protocol
+/// layer via Ed25519 signatures).
+pub struct QuicConnector;
+
+impl Connector for QuicConnector {
+    type Conn = QuicConnection;
+
+    fn connect<'a>(
+        &'a self,
+        addr: &'a str,
+    ) -> impl Future<Output = anyhow::Result<Self::Conn>> + Send + 'a {
+        connect_quic(addr)
     }
 }
 
@@ -775,5 +863,254 @@ mod tests {
         assert_eq!(n, 0);
 
         client_handle.await.unwrap();
+    }
+
+    // ── QuicConnector / connect_quic tests ──────────────────────
+
+    #[tokio::test]
+    async fn given_invalid_address_when_connect_quic_then_returns_error() {
+        let result = connect_quic("999.999.999.999:9999").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn given_unparseable_address_when_connect_quic_then_returns_error() {
+        let result = connect_quic("not-an-address").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_connect_to_invalid_addr_then_returns_error() {
+        let connector = QuicConnector;
+        let result = Connector::connect(&connector, "999.999.999.999:9999").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_connected_then_peer_address_matches() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        let client_peer = client_conn.peer();
+        assert!(client_peer.starts_with("127.0.0.1:"));
+
+        // Drive the control channel so the server side can complete.
+        client_conn.write_all(b"ping").await.unwrap();
+
+        let mut server_conn = server_handle.await.unwrap();
+        let server_peer = server_conn.peer();
+        assert!(server_peer.starts_with("127.0.0.1:"));
+
+        let mut buf = [0u8; 64];
+        let n = server_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_client_writes_then_server_reads() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 128];
+            let n = conn.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        client_conn
+            .write_all(b"hello from quic client")
+            .await
+            .unwrap();
+        client_conn.shutdown().await.unwrap();
+
+        let received = server_handle.await.unwrap();
+        assert_eq!(received, "hello from quic client");
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_server_writes_then_client_reads() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            // Server must read from client first (client opens the
+            // control stream, server accepts it).
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+            conn.write_all(b"hello from quic server").await.unwrap();
+            // Keep connection alive until the client has finished reading.
+            let _ = done_rx.await;
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        // Client writes first to establish the control stream.
+        client_conn.write_all(b"hi").await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let n = client_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello from quic server");
+
+        let _ = done_tx.send(());
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_bidirectional_exchange_then_both_sides_receive() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = conn.read(&mut buf).await.unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            conn.write_all(b"pong").await.unwrap();
+            // Keep connection alive until the client has finished reading.
+            let _ = done_rx.await;
+            received
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        client_conn.write_all(b"ping").await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = client_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
+
+        let _ = done_tx.send(());
+        let server_received = server_handle.await.unwrap();
+        assert_eq!(server_received, "ping");
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_client_opens_data_stream_then_server_accepts_it() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            // Read control channel.
+            let mut buf = [0u8; 64];
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ctrl");
+            // Accept data stream.
+            let mut data_stream = conn.accept_stream().await.unwrap();
+            let mut data_buf = [0u8; 128];
+            let n = data_stream.read(&mut data_buf).await.unwrap();
+            String::from_utf8_lossy(&data_buf[..n]).to_string()
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        // Write on control channel.
+        client_conn.write_all(b"ctrl").await.unwrap();
+        // Open a data stream and write.
+        let mut data_stream = client_conn.open_stream().await.unwrap();
+        data_stream.write_all(b"file-payload").await.unwrap();
+        data_stream.shutdown().await.unwrap();
+
+        let received = server_handle.await.unwrap();
+        assert_eq!(received, "file-payload");
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_server_opens_data_stream_then_client_accepts_it() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            // Read control channel.
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+            // Open a data stream from server to client.
+            let mut data_stream = conn.open_stream().await.unwrap();
+            data_stream.write_all(b"server-file-data").await.unwrap();
+            data_stream.shutdown().await.unwrap();
+            // Keep connection alive until the client has finished reading.
+            let _ = done_rx.await;
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        // Write on control channel to establish it.
+        client_conn.write_all(b"go").await.unwrap();
+        // Accept data stream from server.
+        let mut data_stream = client_conn.accept_stream().await.unwrap();
+        let mut buf = [0u8; 128];
+        let n = data_stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"server-file-data");
+
+        let _ = done_tx.send(());
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_connector_when_large_payload_on_data_stream_then_data_intact() {
+        let factory = QuicListenerFactory::new().unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let connector = QuicConnector;
+
+        let payload: Vec<u8> = (0u32..131_072).map(|i| (i % 251) as u8).collect();
+        let payload_clone = payload.clone();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+
+            let mut data_stream = conn.accept_stream().await.unwrap();
+            let mut received = Vec::new();
+            let mut data_buf = [0u8; 4096];
+            loop {
+                let n = data_stream.read(&mut data_buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&data_buf[..n]);
+            }
+            received
+        });
+
+        let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
+        client_conn.write_all(b"go").await.unwrap();
+
+        let mut data_stream = client_conn.open_stream().await.unwrap();
+        data_stream.write_all(&payload_clone).await.unwrap();
+        data_stream.shutdown().await.unwrap();
+
+        let received = server_handle.await.unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
     }
 }
