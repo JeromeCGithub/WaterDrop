@@ -166,8 +166,6 @@ pub fn encode_frame_to_bytes(msg_type: MessageType, payload: &[u8]) -> BytesMut 
     buf
 }
 
-// ── JSON payload types ──────────────────────────────────────────────
-
 /// Payload for [`MessageType::Hello`] (sender → receiver).
 ///
 /// Identifies the sender device. In v1-MVP (no pairing), only
@@ -335,8 +333,6 @@ mod tests {
             assert_eq!(u8::from(parsed), code);
         }
     }
-
-    // ── Payload round-trip tests ────────────────────────────────────
 
     /// Given a HelloPayload, when serialized and deserialized, then all fields match.
     #[test]

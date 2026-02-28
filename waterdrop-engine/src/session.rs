@@ -14,13 +14,11 @@ async fn emit(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     }
 }
 
-use waterdrop_core::transport::{Connection, DataStream};
 use waterdrop_core::protocol::{
     self, HelloAckPayload, HelloPayload, MessageType, TransferDecisionPayload, TransferDonePayload,
     TransferOfferPayload, decode_payload, encode_payload_frame, try_decode_frame,
 };
-
-// ── Session commands (UI → session) ─────────────────────────────────
+use waterdrop_core::transport::{Connection, DataStream};
 
 /// Commands sent by the UI / CLI to steer a running session.
 ///
@@ -36,8 +34,6 @@ pub enum SessionCmd {
     /// frame (best-effort) and shut down.
     Cancel,
 }
-
-// ── Session events (session → UI) ───────────────────────────────────
 
 /// Events emitted by a session for the UI / CLI to observe.
 ///
@@ -79,8 +75,6 @@ pub enum SessionEvent {
     /// The session has fully shut down.
     Finished,
 }
-
-// ── Session state machine ───────────────────────────────────────────
 
 /// The role this session is playing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,17 +203,14 @@ impl<C: Connection> Session<C> {
     /// Runs until the state machine reaches [`SessionState::Done`] or an
     /// unrecoverable error occurs.
     async fn run(mut self) -> Result<()> {
-        // ── Handshake phase ─────────────────────────────────────────
         self.do_handshake().await?;
 
-        // ── Post-handshake: if client has a send request, send the offer
         if self.role == Role::Client
             && let Some(req) = self.send_request.take()
         {
             self.send_transfer_offer(&req).await?;
         }
 
-        // ── Main select loop ────────────────────────────────────────
         let mut read_buf = [0u8; 4096];
 
         loop {
@@ -281,8 +272,6 @@ impl<C: Connection> Session<C> {
         Ok(())
     }
 
-    // ── Handshake ───────────────────────────────────────────────────
-
     async fn do_handshake(&mut self) -> Result<()> {
         match self.role {
             Role::Client => {
@@ -340,8 +329,6 @@ impl<C: Connection> Session<C> {
         Ok(())
     }
 
-    // ── Transfer offer (client side) ────────────────────────────────
-
     async fn send_transfer_offer(&mut self, req: &SendRequest) -> Result<()> {
         let offer = TransferOfferPayload {
             transfer_id: req.transfer_id.clone(),
@@ -355,8 +342,6 @@ impl<C: Connection> Session<C> {
         });
         Ok(())
     }
-
-    // ── User decision (server side) ─────────────────────────────────
 
     async fn handle_user_decision(&mut self, transfer_id: &str, accept: bool) -> Result<()> {
         // Verify we are in the right state.
@@ -394,8 +379,6 @@ impl<C: Connection> Session<C> {
         }
         Ok(())
     }
-
-    // ── Frame dispatch ──────────────────────────────────────────────
 
     /// Drains all complete frames from the accumulation buffer and
     /// dispatches them to the appropriate handler.
@@ -452,8 +435,6 @@ impl<C: Connection> Session<C> {
         }
         Ok(())
     }
-
-    // ── Frame handlers ──────────────────────────────────────────────
 
     /// Server receives TRANSFER_OFFER while idle.
     async fn on_transfer_offer(&mut self, payload: &[u8]) -> Result<()> {
@@ -583,8 +564,6 @@ impl<C: Connection> Session<C> {
         emit(&self.event_tx, SessionEvent::Finished).await;
     }
 
-    // ── File streaming (sender) ─────────────────────────────────────
-
     /// Opens a data stream and writes the file bytes.
     ///
     /// The file path is currently hardcoded via the [`SendRequest`]
@@ -627,8 +606,6 @@ impl<C: Connection> Session<C> {
         // We go back to the select loop; the state is still Transferring.
         Ok(())
     }
-
-    // ── File receiving (receiver) ───────────────────────────────────
 
     /// Accepts a data stream and reads exactly `size_bytes`.
     async fn receive_file(&mut self, offer: &TransferOfferPayload) -> Result<()> {
@@ -710,8 +687,6 @@ impl<C: Connection> Session<C> {
         Ok(())
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────
-
     fn transition(&mut self, new_state: SessionState) {
         debug!(from = ?self.state, to = ?new_state, "State transition");
         self.state = new_state;
@@ -760,8 +735,6 @@ impl<C: Connection> Session<C> {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -771,14 +744,12 @@ mod tests {
     use anyhow::Result;
     use tokio::sync::mpsc;
 
-    use waterdrop_core::transport::{Connection, DataStream};
     use waterdrop_core::protocol::{
         HelloAckPayload, MessageType, TransferOfferPayload, encode_payload_frame, try_decode_frame,
     };
+    use waterdrop_core::transport::{Connection, DataStream};
 
     use super::*;
-
-    // ── Mock transport ──────────────────────────────────────────────
 
     /// A bidirectional in-memory byte pipe used as a mock data stream.
     struct MemoryPipe {
@@ -930,8 +901,6 @@ mod tests {
         }
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────
-
     async fn collect_events_until(
         rx: &mut mpsc::Receiver<SessionEvent>,
         pred: impl Fn(&SessionEvent) -> bool,
@@ -967,8 +936,6 @@ mod tests {
     fn make_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
     }
-
-    // ── Tests ───────────────────────────────────────────────────────
 
     /// Given a client and server, when they run the handshake, then both
     /// emit Connected events with each other's device name.

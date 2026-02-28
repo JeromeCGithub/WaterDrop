@@ -7,8 +7,6 @@ use waterdrop_core::transport::{Connection, Connector, Listener, ListenerFactory
 
 use crate::session::{Role, SendRequest, Session, SessionCmd, SessionEvent};
 
-// ── Engine commands (UI → engine) ───────────────────────────────────
-
 /// Commands sent by the CLI / UI to control the engine.
 #[derive(Clone, Debug)]
 pub enum EngineCmd {
@@ -27,8 +25,6 @@ pub enum EngineCmd {
     /// Gracefully shut down the entire engine.
     ShutDown,
 }
-
-// ── Engine events (engine → UI) ─────────────────────────────────────
 
 /// Events emitted by the engine for the CLI / UI to observe.
 #[derive(Clone, Debug)]
@@ -49,16 +45,12 @@ pub enum EngineEvent {
     Error { message: String },
 }
 
-// ── Engine handle ───────────────────────────────────────────────────
-
 /// Handle returned by [`Engine::start`].  Lets the caller send commands
 /// and subscribe to events.
 pub struct EngineHandle {
     pub cmd_tx: mpsc::Sender<EngineCmd>,
     pub events_tx: broadcast::Sender<EngineEvent>,
 }
-
-// ── Engine ──────────────────────────────────────────────────────────
 
 /// Configuration shared by all sessions created by the engine.
 #[derive(Clone, Debug)]
@@ -146,7 +138,6 @@ async fn run_engine_loop<F, K>(
         tokio::select! {
             biased;
 
-            // ── Commands ────────────────────────────────────────
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(EngineCmd::StartAccepting { addr }) => {
@@ -242,7 +233,6 @@ async fn run_engine_loop<F, K>(
                 }
             }
 
-            // ── Accept inbound connections ───────────────────────
             result = async {
                 if let Some(l) = listener.as_mut() {
                     l.accept().await
@@ -312,8 +302,6 @@ fn spawn_event_forwarder(
         debug!(session_id = session_id, "Session event forwarder stopped");
     });
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

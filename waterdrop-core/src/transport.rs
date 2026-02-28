@@ -48,8 +48,6 @@ pub trait Connection: Send + 'static {
     /// (e.g. `"127.0.0.1:54321"`).
     fn peer(&self) -> String;
 
-    // ── Control channel ─────────────────────────────────────────
-
     /// Reads bytes into `buf`, returning how many bytes were read.
     ///
     /// Returns `Ok(0)` when the remote end has closed the connection.
@@ -67,8 +65,6 @@ pub trait Connection: Send + 'static {
     /// Shuts down the write half of the connection, signalling to the
     /// remote end that no more data will be sent.
     fn shutdown(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send + '_;
-
-    // ── Data streams ────────────────────────────────────────────
 
     /// Opens a new bidirectional data stream (sender side).
     ///

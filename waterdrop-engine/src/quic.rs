@@ -277,8 +277,6 @@ impl ListenerFactory for QuicListenerFactory {
     }
 }
 
-// ── Outbound (client) connections ───────────────────────────────────
-
 /// Creates a QUIC client connection to the given address.
 ///
 /// Returns a [`QuicConnection`] in [`QuicMode::Client`], ready for use

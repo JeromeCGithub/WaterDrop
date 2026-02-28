@@ -94,12 +94,10 @@ async fn main() {
     // the banner.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // ── Banner ──────────────────────────────────────────────────
     print_banner(&args.listen, &args.name, &args.receive_dir);
     print_help();
     print_prompt();
 
-    // ── Interactive prompt loop ─────────────────────────────────
     let mut stdin = BufReader::new(tokio::io::stdin());
 
     loop {
