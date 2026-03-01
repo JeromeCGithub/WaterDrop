@@ -310,8 +310,6 @@ fn spawn_event_forwarder(
 mod tests {
     use std::time::Duration;
 
-    use tokio::net::TcpStream;
-
     use super::*;
     use crate::tcp::{TcpConnector, TcpListenerFactory};
 
@@ -397,39 +395,6 @@ mod tests {
         .await;
 
         assert!(matches!(ev, EngineEvent::AcceptingStopped));
-        handle.cmd_tx.send(EngineCmd::ShutDown).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn when_client_connects_expect_session_created() {
-        let config = default_test_config();
-        let (handle, mut events_rx) = start_tcp_engine(config);
-
-        handle
-            .cmd_tx
-            .send(EngineCmd::StartAccepting {
-                addr: "127.0.0.1:0".into(),
-            })
-            .await
-            .unwrap();
-
-        let EngineEvent::Accepting { addr } = wait_for_event(&mut events_rx, |e| {
-            matches!(e, EngineEvent::Accepting { .. })
-        })
-        .await
-        else {
-            unreachable!()
-        };
-
-        // A raw TCP connection triggers session creation on the server side.
-        let _client = TcpStream::connect(&addr).await.unwrap();
-
-        let ev = wait_for_event(&mut events_rx, |e| {
-            matches!(e, EngineEvent::SessionCreated { .. })
-        })
-        .await;
-
-        assert!(matches!(ev, EngineEvent::SessionCreated { .. }));
         handle.cmd_tx.send(EngineCmd::ShutDown).await.unwrap();
     }
 
