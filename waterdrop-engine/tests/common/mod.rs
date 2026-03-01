@@ -18,7 +18,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use waterdrop_core::transport::{Connection, DataStream, Listener, ListenerFactory};
-use waterdrop_engine::quic::{QuicListenerFactory, connect_quic};
+use waterdrop_engine::quic::{QuicConnector, QuicListenerFactory, connect_quic};
 use waterdrop_engine::session::{Role, SendRequest, Session, SessionEvent, SessionHandle};
 use waterdrop_engine::tcp::{TcpListenerFactory, connect_yamux};
 
@@ -257,7 +257,10 @@ pub fn mock_session_pair(send_dir: &Path, recv_dir: &Path) -> (SessionHandle, Se
 /// The server accept and client connect happen concurrently to avoid
 /// deadlocking the single-threaded test runtime.
 pub async fn quic_session_pair(send_dir: &Path, recv_dir: &Path) -> (SessionHandle, SessionHandle) {
-    let factory = QuicListenerFactory::new().unwrap();
+    let cert_dir = tempfile::tempdir().unwrap();
+    let trust_dir = tempfile::tempdir().unwrap();
+
+    let factory = QuicListenerFactory::new(cert_dir.path()).unwrap();
     let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr();
 
@@ -267,7 +270,8 @@ pub async fn quic_session_pair(send_dir: &Path, recv_dir: &Path) -> (SessionHand
         Session::spawn(conn, Role::Server, "QuicServer".into(), recv_path)
     });
 
-    let client_conn = connect_quic(&addr).await.unwrap();
+    let trust_path = trust_dir.path().to_path_buf();
+    let client_conn = connect_quic(&addr, &trust_path).await.unwrap();
     let handle_c = Session::spawn(
         client_conn,
         Role::Client,
@@ -276,6 +280,11 @@ pub async fn quic_session_pair(send_dir: &Path, recv_dir: &Path) -> (SessionHand
     );
 
     let handle_s = server_task.await.unwrap();
+
+    // Leak the tempdirs so they live long enough for the sessions.
+    std::mem::forget(cert_dir);
+    std::mem::forget(trust_dir);
+
     (handle_c, handle_s)
 }
 

@@ -1,8 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use waterdrop_core::tls;
 use waterdrop_core::transport::{Connection, Connector, DataStream, Listener, ListenerFactory};
@@ -188,19 +189,21 @@ impl Listener for QuicListener {
 
 /// Factory that binds [`QuicListener`] instances on the given address.
 ///
-/// A self-signed certificate is generated at construction time and reused
-/// for every listener.  Authentication happens at the WaterDrop protocol
-/// layer (Ed25519 signatures), not at TLS level.
+/// The server certificate is persisted to `cert_dir` so that clients can
+/// recognise the server across restarts (TOFU — Trust On First Use).
 pub struct QuicListenerFactory {
     server_config: quinn::ServerConfig,
 }
 
 impl QuicListenerFactory {
+    /// Creates a new factory that loads (or generates and saves) a server
+    /// certificate in `cert_dir`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if certificate generation or TLS configuration fails.
-    pub fn new() -> anyhow::Result<Self> {
-        let server_config = build_server_config()?;
+    /// Returns an error if certificate I/O or TLS configuration fails.
+    pub fn new(cert_dir: &Path) -> anyhow::Result<Self> {
+        let server_config = build_server_config(cert_dir)?;
         Ok(Self { server_config })
     }
 }
@@ -237,14 +240,15 @@ impl ListenerFactory for QuicListenerFactory {
 
 /// Creates a QUIC client connection to the given address.
 ///
-/// Returns a [`QuicConnection`] with the control stream already open,
-/// ready for immediate I/O via the [`Connection`] trait.
+/// `trust_store` is the directory where TOFU fingerprints are stored.
+/// On first contact with a server, its certificate fingerprint is saved.
+/// On subsequent connections, the server's certificate must match.
 ///
 /// # Errors
 ///
 /// Returns an error if the address cannot be parsed, the client endpoint
 /// cannot be created, or the QUIC handshake fails.
-pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
+pub async fn connect_quic(addr: &str, trust_store: &Path) -> anyhow::Result<QuicConnection> {
     let socket_addr: std::net::SocketAddr = addr
         .parse()
         .with_context(|| format!("invalid connect address: {addr}"))?;
@@ -254,7 +258,7 @@ pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
         .context("failed to parse ephemeral bind address")?;
     let mut endpoint =
         quinn::Endpoint::client(bind_addr).context("failed to create QUIC client endpoint")?;
-    endpoint.set_default_client_config(insecure_client_config()?);
+    endpoint.set_default_client_config(tofu_client_config(trust_store)?);
 
     let connection = endpoint
         .connect(socket_addr, "localhost")
@@ -281,12 +285,20 @@ pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
 
 /// Factory that creates outbound [`QuicConnection`]s (client side).
 ///
-/// This is the client-mode counterpart to [`QuicListenerFactory`].
-/// A fresh ephemeral endpoint is created for each connection with an
-/// insecure TLS configuration (server certificate verification is
-/// skipped because authentication happens at the WaterDrop protocol
-/// layer).
-pub struct QuicConnector;
+/// Certificate fingerprints are persisted in `trust_store` using TOFU
+/// (Trust On First Use).
+pub struct QuicConnector {
+    trust_store: PathBuf,
+}
+
+impl QuicConnector {
+    #[must_use]
+    pub fn new(trust_store: &Path) -> Self {
+        Self {
+            trust_store: trust_store.to_path_buf(),
+        }
+    }
+}
 
 impl Connector for QuicConnector {
     type Conn = QuicConnection;
@@ -295,12 +307,15 @@ impl Connector for QuicConnector {
         &'a self,
         addr: &'a str,
     ) -> impl Future<Output = anyhow::Result<Self::Conn>> + Send + 'a {
-        connect_quic(addr)
+        connect_quic(addr, &self.trust_store)
     }
 }
 
-fn build_server_config() -> anyhow::Result<quinn::ServerConfig> {
-    let pair = tls::generate_self_signed_cert(&["localhost"])?;
+fn build_server_config(certs_dir: &Path) -> anyhow::Result<quinn::ServerConfig> {
+    let pair = tls::load_or_generate_cert(certs_dir, &["localhost"])?;
+
+    let fp = tls::fingerprint_sha256(&pair.cert_der);
+    info!(fingerprint = %fp, "server certificate fingerprint");
 
     let cert_der = rustls::pki_types::CertificateDer::from(pair.cert_der);
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -321,18 +336,23 @@ fn build_server_config() -> anyhow::Result<quinn::ServerConfig> {
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
 }
 
-/// Builds a QUIC client config that skips server certificate verification.
+/// Builds a QUIC client config with TOFU certificate verification.
 ///
-/// This is appropriate for WaterDrop because authentication happens at the
-/// protocol layer (Ed25519 signatures), not at TLS level.
+/// TLS handshake signatures are fully verified. On first connection to a
+/// server, its certificate fingerprint is stored in `trust_store`. On
+/// subsequent connections, the fingerprint must match or the handshake is
+/// rejected.
 ///
 /// # Errors
 ///
-/// Returns an error if the TLS client configuration fails to build.
-pub fn insecure_client_config() -> anyhow::Result<quinn::ClientConfig> {
+/// Returns an error if the trust store directory cannot be created or
+/// the TLS client configuration fails to build.
+pub fn tofu_client_config(trust_store: &Path) -> anyhow::Result<quinn::ClientConfig> {
+    let verifier = TofuVerifier::new(trust_store)?;
+
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
 
     tls_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
@@ -344,37 +364,108 @@ pub fn insecure_client_config() -> anyhow::Result<quinn::ClientConfig> {
     Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
 }
 
+/// Trust-On-First-Use certificate verifier.
+///
+/// - TLS handshake signatures are always verified cryptographically.
+/// - On first connection, the server certificate fingerprint is persisted
+///   to a file named `<fingerprint>.fp` inside the trust store directory.
+/// - On subsequent connections, the presented certificate must have a
+///   fingerprint that exists in the store.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct TofuVerifier {
+    store_dir: PathBuf,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+impl TofuVerifier {
+    fn new(store_dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(store_dir)
+            .with_context(|| format!("failed to create trust store {}", store_dir.display()))?;
+        Ok(Self {
+            store_dir: store_dir.to_path_buf(),
+        })
+    }
+
+    fn fingerprint_path(&self, fingerprint: &str) -> PathBuf {
+        self.store_dir.join(format!("{fingerprint}.fp"))
+    }
+
+    fn is_trusted(&self, fingerprint: &str) -> bool {
+        self.fingerprint_path(fingerprint).exists()
+    }
+
+    fn has_any_fingerprint(&self) -> bool {
+        std::fs::read_dir(&self.store_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .any(|e| e.path().extension().is_some_and(|ext| ext == "fp"))
+            })
+            .unwrap_or(false)
+    }
+
+    fn trust(&self, fingerprint: &str) -> Result<(), rustls::Error> {
+        std::fs::write(self.fingerprint_path(fingerprint), fingerprint.as_bytes())
+            .map_err(|e| rustls::Error::General(format!("failed to persist TOFU fingerprint: {e}")))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fingerprint = tls::fingerprint_sha256(end_entity.as_ref());
+
+        if self.is_trusted(&fingerprint) {
+            debug!(fingerprint = %fingerprint, "server certificate matches trusted fingerprint");
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+
+        if self.has_any_fingerprint() {
+            warn!(
+                fingerprint = %fingerprint,
+                "server certificate fingerprint not in trust store — possible impersonation"
+            );
+            return Err(rustls::Error::General(format!(
+                "TOFU: server certificate fingerprint {fingerprint} is not trusted"
+            )));
+        }
+
+        info!(fingerprint = %fingerprint, "first contact — trusting server certificate (TOFU)");
+        self.trust(&fingerprint)?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -388,23 +479,29 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use super::*;
 
-    fn make_client_endpoint() -> anyhow::Result<quinn::Endpoint> {
+    fn make_server(cert_dir: &Path) -> anyhow::Result<QuicListenerFactory> {
+        QuicListenerFactory::new(cert_dir)
+    }
+
+    fn make_client_endpoint(trust_store: &Path) -> anyhow::Result<quinn::Endpoint> {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
             .context("failed to create client endpoint")?;
-        endpoint.set_default_client_config(insecure_client_config()?);
+        endpoint.set_default_client_config(tofu_client_config(trust_store)?);
         Ok(endpoint)
     }
 
     #[tokio::test]
     async fn given_invalid_address_when_binding_then_returns_error() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let factory = make_server(dir.path()).unwrap();
         let result = factory.bind("999.999.999.999:0").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn given_valid_address_when_binding_then_returns_listener_with_local_addr() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let factory = make_server(dir.path()).unwrap();
         let listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
         assert!(addr.starts_with("127.0.0.1:"));
@@ -414,25 +511,22 @@ mod tests {
 
     #[tokio::test]
     async fn given_client_connects_when_accepted_then_peer_address_matches() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        // Spawn the server side so that accept (which now eagerly waits
-        // for the control stream) can run concurrently with connect_quic.
         let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
-        let mut client_conn = connect_quic(&addr).await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
         let client_peer: std::net::SocketAddr = client_conn.peer().parse().unwrap();
 
-        // Drive the control channel so the server side can complete
-        // (QUIC coalesces the stream header with the first data write).
         client_conn.write_all(b"ping").await.unwrap();
 
         let mut server_conn = server_handle.await.unwrap();
         let server_peer: std::net::SocketAddr = server_conn.peer().parse().unwrap();
 
-        // Drain the ping so the server connection is clean.
         let mut buf = [0u8; 16];
         let n = server_conn.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping");
@@ -442,11 +536,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_client_sends_data_when_server_reads_then_data_matches() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let client_endpoint = make_client_endpoint(trust_dir.path()).unwrap();
 
         let client_handle = tokio::spawn(async move {
             let connection = client_endpoint
@@ -470,11 +566,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_server_sends_data_when_client_reads_then_data_matches() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let client_endpoint = make_client_endpoint(trust_dir.path()).unwrap();
 
         let client_handle = tokio::spawn(async move {
             let connection = client_endpoint
@@ -484,8 +582,6 @@ mod tests {
                 .unwrap();
             let (mut send, mut recv) = connection.open_bi().await.unwrap();
 
-            // Client writes first, matching the WaterDrop protocol flow
-            // where the sender always sends HELLO before the receiver responds.
             send.write_all(b"greeting").await.unwrap();
 
             let mut buf = [0u8; 64];
@@ -507,343 +603,295 @@ mod tests {
 
     #[tokio::test]
     async fn given_client_closes_stream_when_server_reads_then_returns_zero() {
-        let factory = QuicListenerFactory::new().unwrap();
-        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
-
-        let client_endpoint = make_client_endpoint().unwrap();
-
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-            let (mut send, _recv) = connection.open_bi().await.unwrap();
-            send.finish().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        });
-
-        let mut server_conn = listener.accept().await.unwrap();
-        let mut buf = [0u8; 64];
-        let n = server_conn.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
-
-        client_handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::similar_names)]
-    async fn given_two_clients_when_accepted_then_peers_are_distinct() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        // Spawn the server side so that both accepts can run concurrently
-        // with the client connections.
         let server_handle = tokio::spawn(async move {
-            let conn1 = listener.accept().await.unwrap();
-            let conn2 = listener.accept().await.unwrap();
-            (conn1, conn2)
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"bye");
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0);
         });
 
-        // Write data on each control channel to flush the QUIC stream
-        // frames (QUIC coalesces the stream header with the first write).
-        let addr1 = addr.clone();
-        let mut client1 = connect_quic(&addr1).await.unwrap();
-        client1.write_all(b"c1").await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"bye").await.unwrap();
+        client_conn.shutdown().await.unwrap();
 
-        let mut client2 = connect_quic(&addr).await.unwrap();
-        client2.write_all(b"c2").await.unwrap();
+        server_handle.await.unwrap();
+    }
 
-        let (conn1, conn2) = server_handle.await.unwrap();
+    #[tokio::test]
+    async fn given_two_clients_when_accepted_then_peers_are_distinct() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let td = trust_dir.path().to_path_buf();
+        let addr_clone = addr.clone();
+        let c1 = tokio::spawn(async move {
+            let mut conn = connect_quic(&addr_clone, &td).await.unwrap();
+            conn.write_all(b"c1").await.unwrap();
+            conn
+        });
+
+        let td = trust_dir.path().to_path_buf();
+        let addr_clone = addr.clone();
+        let c2 = tokio::spawn(async move {
+            let mut conn = connect_quic(&addr_clone, &td).await.unwrap();
+            conn.write_all(b"c2").await.unwrap();
+            conn
+        });
+
+        let conn1 = listener.accept().await.unwrap();
+        let conn2 = listener.accept().await.unwrap();
+
         assert_ne!(conn1.peer(), conn2.peer());
+
+        let _ = c1.await.unwrap();
+        let _ = c2.await.unwrap();
     }
 
     #[tokio::test]
     async fn given_large_payload_when_sent_and_received_then_data_is_intact() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
-
-        #[allow(clippy::cast_sign_loss)]
-        let payload: Vec<u8> = (0..131_072).map(|i| (i % 251) as u8).collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let payload: Vec<u8> = (0u32..65_536).map(|i| (i % 251) as u8).collect();
         let payload_clone = payload.clone();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-            let (mut send, _recv) = connection.open_bi().await.unwrap();
-            send.write_all(&payload_clone).await.unwrap();
-            send.finish().unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = conn.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..n]);
+            }
+            received
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
-        let mut received = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = server_conn.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            received.extend_from_slice(&buf[..n]);
-        }
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(&payload_clone).await.unwrap();
+        client_conn.shutdown().await.unwrap();
 
+        let received = server_handle.await.unwrap();
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
-
-        client_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn given_bidirectional_exchange_when_both_sides_send_then_both_receive() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-            let (mut send, mut recv) = connection.open_bi().await.unwrap();
-
-            send.write_all(b"ping").await.unwrap();
-            send.finish().unwrap();
-
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
             let mut buf = [0u8; 64];
-            let n = recv.read(&mut buf).await.unwrap().unwrap_or(0);
-            String::from_utf8_lossy(&buf[..n]).to_string()
+            let n = conn.read(&mut buf).await.unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            conn.write_all(b"pong").await.unwrap();
+            let _ = done_rx.await;
+            received
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"ping").await.unwrap();
 
         let mut buf = [0u8; 64];
-        let n = server_conn.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ping");
+        let n = client_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong");
 
-        server_conn.write_all(b"pong").await.unwrap();
-        server_conn.shutdown().await.unwrap();
-
-        let client_received = client_handle.await.unwrap();
-        assert_eq!(client_received, "pong");
+        let _ = done_tx.send(());
+        let server_received = server_handle.await.unwrap();
+        assert_eq!(server_received, "ping");
     }
-
-    // ── Data-stream tests ───────────────────────────────────────
 
     #[tokio::test]
     async fn given_client_opens_data_stream_when_server_accepts_then_data_flows() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ctrl");
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-
-            // Open the control stream first (stream 0).
-            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
-            ctrl_send.write_all(b"hello").await.unwrap();
-
-            // Open a second stream for data (stream 1).
-            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
-            data_send.write_all(b"file-data-abc").await.unwrap();
-            data_send.finish().unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let mut data_stream = conn.accept_stream().await.unwrap();
+            let mut data_buf = [0u8; 128];
+            let n = data_stream.read(&mut data_buf).await.unwrap();
+            String::from_utf8_lossy(&data_buf[..n]).to_string()
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"ctrl").await.unwrap();
 
-        // Read from control channel.
-        let mut buf = [0u8; 64];
-        let n = server_conn.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"hello");
+        let mut data_stream = client_conn.open_stream().await.unwrap();
+        data_stream.write_all(b"stream-payload").await.unwrap();
+        data_stream.shutdown().await.unwrap();
 
-        // Accept data stream.
-        let mut data_stream = server_conn.accept_stream().await.unwrap();
-        let mut data_buf = [0u8; 64];
-        let n = data_stream.read(&mut data_buf).await.unwrap();
-        assert_eq!(&data_buf[..n], b"file-data-abc");
-
-        client_handle.await.unwrap();
+        let received = server_handle.await.unwrap();
+        assert_eq!(received, "stream-payload");
     }
 
     #[tokio::test]
     async fn given_server_opens_data_stream_when_client_accepts_then_data_flows() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-
-            // Open the control stream (stream 0).
-            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
-            ctrl_send.write_all(b"ctrl").await.unwrap();
-
-            // Accept data stream opened by server.
-            let (_, mut data_recv) = connection.accept_bi().await.unwrap();
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
             let mut buf = [0u8; 64];
-            let n = data_recv.read(&mut buf).await.unwrap().unwrap_or(0);
-            String::from_utf8_lossy(&buf[..n]).to_string()
+            let _n = conn.read(&mut buf).await.unwrap();
+            let mut data_stream = conn.open_stream().await.unwrap();
+            data_stream.write_all(b"server-data").await.unwrap();
+            data_stream.shutdown().await.unwrap();
+            let _ = done_rx.await;
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"go").await.unwrap();
 
-        // Read from control channel.
-        let mut buf = [0u8; 64];
-        let n = server_conn.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ctrl");
+        let mut data_stream = client_conn.accept_stream().await.unwrap();
+        let mut buf = [0u8; 128];
+        let n = data_stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"server-data");
 
-        // Server opens a data stream.
-        let mut data_stream = server_conn.open_stream().await.unwrap();
-        data_stream.write_all(b"server-data").await.unwrap();
-        data_stream.shutdown().await.unwrap();
-
-        let client_received = client_handle.await.unwrap();
-        assert_eq!(client_received, "server-data");
+        let _ = done_tx.send(());
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn given_large_payload_on_data_stream_when_received_then_data_is_intact() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
-
+        #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0u32..131_072).map(|i| (i % 251) as u8).collect();
         let payload_clone = payload.clone();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
 
-            // Control stream first.
-            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
-            ctrl_send.write_all(b"go").await.unwrap();
-
-            // Data stream with large payload.
-            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
-            data_send.write_all(&payload_clone).await.unwrap();
-            data_send.finish().unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let mut data_stream = conn.accept_stream().await.unwrap();
+            let mut received = Vec::new();
+            let mut data_buf = [0u8; 4096];
+            loop {
+                let n = data_stream.read(&mut data_buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&data_buf[..n]);
+            }
+            received
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"go").await.unwrap();
 
-        let mut buf = [0u8; 64];
-        let _n = server_conn.read(&mut buf).await.unwrap();
+        let mut data_stream = client_conn.open_stream().await.unwrap();
+        data_stream.write_all(&payload_clone).await.unwrap();
+        data_stream.shutdown().await.unwrap();
 
-        let mut data_stream = server_conn.accept_stream().await.unwrap();
-        let mut received = Vec::new();
-        let mut data_buf = [0u8; 4096];
-        loop {
-            let n = data_stream.read(&mut data_buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            received.extend_from_slice(&data_buf[..n]);
-        }
-
+        let received = server_handle.await.unwrap();
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
-
-        client_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn given_data_stream_closed_when_read_then_returns_zero() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-
-            // Control stream.
-            let (mut ctrl_send, _ctrl_recv) = connection.open_bi().await.unwrap();
-            ctrl_send.write_all(b"hi").await.unwrap();
-
-            // Data stream — finish immediately.
-            let (mut data_send, _data_recv) = connection.open_bi().await.unwrap();
-            data_send.finish().unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let mut data_stream = conn.accept_stream().await.unwrap();
+            let mut data_buf = [0u8; 64];
+            let n = data_stream.read(&mut data_buf).await.unwrap();
+            assert_eq!(&data_buf[..n], b"data");
+            let n = data_stream.read(&mut data_buf).await.unwrap();
+            assert_eq!(n, 0);
         });
 
-        let mut server_conn = listener.accept().await.unwrap();
+        let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        client_conn.write_all(b"ctrl").await.unwrap();
 
-        let mut buf = [0u8; 64];
-        let _n = server_conn.read(&mut buf).await.unwrap();
+        let mut data_stream = client_conn.open_stream().await.unwrap();
+        data_stream.write_all(b"data").await.unwrap();
+        data_stream.shutdown().await.unwrap();
 
-        let mut data_stream = server_conn.accept_stream().await.unwrap();
-        let mut data_buf = [0u8; 64];
-        let n = data_stream.read(&mut data_buf).await.unwrap();
-        assert_eq!(n, 0);
-
-        client_handle.await.unwrap();
+        server_handle.await.unwrap();
     }
-
-    // ── QuicConnector / connect_quic tests ──────────────────────
 
     #[tokio::test]
     async fn given_invalid_address_when_connect_quic_then_returns_error() {
-        let result = connect_quic("999.999.999.999:9999").await;
+        let trust_dir = tempfile::tempdir().unwrap();
+        let result = connect_quic("999.999.999.999:9999", trust_dir.path()).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn given_unparseable_address_when_connect_quic_then_returns_error() {
-        let result = connect_quic("not-an-address").await;
+        let trust_dir = tempfile::tempdir().unwrap();
+        let result = connect_quic("not-an-address", trust_dir.path()).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn given_connector_when_connect_to_invalid_addr_then_returns_error() {
-        let connector = QuicConnector;
+        let trust_dir = tempfile::tempdir().unwrap();
+        let connector = QuicConnector::new(trust_dir.path());
         let result = Connector::connect(&connector, "999.999.999.999:9999").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn given_connector_when_connected_then_peer_address_matches() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
@@ -851,7 +899,6 @@ mod tests {
         let client_peer = client_conn.peer();
         assert!(client_peer.starts_with("127.0.0.1:"));
 
-        // Drive the control channel so the server side can complete.
         client_conn.write_all(b"ping").await.unwrap();
 
         let mut server_conn = server_handle.await.unwrap();
@@ -865,11 +912,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_client_writes_then_server_reads() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let server_handle = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
@@ -891,27 +940,25 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_server_writes_then_client_reads() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_handle = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
-            // Server must read from client first (client opens the
-            // control stream, server accepts it).
             let mut buf = [0u8; 64];
             let _n = conn.read(&mut buf).await.unwrap();
             conn.write_all(b"hello from quic server").await.unwrap();
-            // Keep connection alive until the client has finished reading.
             let _ = done_rx.await;
         });
 
         let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
-        // Client writes first to establish the control stream.
         client_conn.write_all(b"hi").await.unwrap();
 
         let mut buf = [0u8; 128];
@@ -924,11 +971,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_bidirectional_exchange_then_both_sides_receive() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -938,7 +987,6 @@ mod tests {
             let n = conn.read(&mut buf).await.unwrap();
             let received = String::from_utf8_lossy(&buf[..n]).to_string();
             conn.write_all(b"pong").await.unwrap();
-            // Keep connection alive until the client has finished reading.
             let _ = done_rx.await;
             received
         });
@@ -957,19 +1005,19 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_client_opens_data_stream_then_server_accepts_it() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let server_handle = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
-            // Read control channel.
             let mut buf = [0u8; 64];
             let n = conn.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"ctrl");
-            // Accept data stream.
             let mut data_stream = conn.accept_stream().await.unwrap();
             let mut data_buf = [0u8; 128];
             let n = data_stream.read(&mut data_buf).await.unwrap();
@@ -977,9 +1025,7 @@ mod tests {
         });
 
         let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
-        // Write on control channel.
         client_conn.write_all(b"ctrl").await.unwrap();
-        // Open a data stream and write.
         let mut data_stream = client_conn.open_stream().await.unwrap();
         data_stream.write_all(b"file-payload").await.unwrap();
         data_stream.shutdown().await.unwrap();
@@ -990,31 +1036,28 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_server_opens_data_stream_then_client_accepts_it() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_handle = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
-            // Read control channel.
             let mut buf = [0u8; 64];
             let _n = conn.read(&mut buf).await.unwrap();
-            // Open a data stream from server to client.
             let mut data_stream = conn.open_stream().await.unwrap();
             data_stream.write_all(b"server-file-data").await.unwrap();
             data_stream.shutdown().await.unwrap();
-            // Keep connection alive until the client has finished reading.
             let _ = done_rx.await;
         });
 
         let mut client_conn = Connector::connect(&connector, &addr).await.unwrap();
-        // Write on control channel to establish it.
         client_conn.write_all(b"go").await.unwrap();
-        // Accept data stream from server.
         let mut data_stream = client_conn.accept_stream().await.unwrap();
         let mut buf = [0u8; 128];
         let n = data_stream.read(&mut buf).await.unwrap();
@@ -1026,12 +1069,15 @@ mod tests {
 
     #[tokio::test]
     async fn given_connector_when_large_payload_on_data_stream_then_data_intact() {
-        let factory = QuicListenerFactory::new().unwrap();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let factory = make_server(cert_dir.path()).unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
 
-        let connector = QuicConnector;
+        let connector = QuicConnector::new(trust_dir.path());
 
+        #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0u32..131_072).map(|i| (i % 251) as u8).collect();
         let payload_clone = payload.clone();
 
@@ -1063,5 +1109,139 @@ mod tests {
         let received = server_handle.await.unwrap();
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn given_same_server_cert_when_client_reconnects_then_tofu_succeeds() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+
+        let factory = make_server(cert_dir.path()).unwrap();
+
+        for _ in 0..3 {
+            let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr();
+
+            let server_handle = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                let mut buf = [0u8; 64];
+                let _n = conn.read(&mut buf).await.unwrap();
+            });
+
+            let mut client_conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+            client_conn.write_all(b"hi").await.unwrap();
+            client_conn.shutdown().await.unwrap();
+
+            server_handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn given_trusted_server_when_different_server_connects_then_tofu_rejects() {
+        let cert_dir_a = tempfile::tempdir().unwrap();
+        let cert_dir_b = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+
+        let factory_a = make_server(cert_dir_a.path()).unwrap();
+        let mut listener_a = factory_a.bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener_a.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+        });
+
+        let mut conn_a = connect_quic(&addr_a, trust_dir.path()).await.unwrap();
+        conn_a.write_all(b"hi").await.unwrap();
+        conn_a.shutdown().await.unwrap();
+        server_handle.await.unwrap();
+
+        let factory_b = make_server(cert_dir_b.path()).unwrap();
+        let mut listener_b = factory_b.bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = listener_b.accept().await;
+        });
+
+        let result = connect_quic(&addr_b, trust_dir.path()).await;
+        assert!(
+            result.is_err(),
+            "TOFU should reject a different server cert"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn given_persisted_cert_when_factory_recreated_then_same_cert_used() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+
+        let factory1 = make_server(cert_dir.path()).unwrap();
+        let mut listener1 = factory1.bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener1.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+        });
+
+        let mut conn = connect_quic(&addr1, trust_dir.path()).await.unwrap();
+        conn.write_all(b"first").await.unwrap();
+        conn.shutdown().await.unwrap();
+        server_handle.await.unwrap();
+
+        let factory2 = make_server(cert_dir.path()).unwrap();
+        let mut listener2 = factory2.bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr();
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener2.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+        });
+
+        let mut conn = connect_quic(&addr2, trust_dir.path()).await.unwrap();
+        conn.write_all(b"second").await.unwrap();
+        conn.shutdown().await.unwrap();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_no_prior_trust_when_first_connect_then_fingerprint_file_created() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+
+        let factory = make_server(cert_dir.path()).unwrap();
+        let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+
+        let fp_files_before: Vec<_> = std::fs::read_dir(trust_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "fp"))
+            .collect();
+        assert!(fp_files_before.is_empty());
+
+        let server_handle = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _n = conn.read(&mut buf).await.unwrap();
+        });
+
+        let mut conn = connect_quic(&addr, trust_dir.path()).await.unwrap();
+        conn.write_all(b"hi").await.unwrap();
+        conn.shutdown().await.unwrap();
+        server_handle.await.unwrap();
+
+        let fp_files_after: Vec<_> = std::fs::read_dir(trust_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "fp"))
+            .collect();
+        assert_eq!(fp_files_after.len(), 1);
     }
 }
