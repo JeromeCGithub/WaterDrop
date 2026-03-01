@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bytes::BytesMut;
@@ -258,6 +259,26 @@ impl<C: Connection> Session<C> {
         }
 
         let _ = self.conn.shutdown().await;
+
+        // Drain the control stream so the underlying transport (especially
+        // QUIC) stays alive long enough for the peer to read any frames we
+        // just sent (e.g. TRANSFER_DONE).  Without this, dropping the
+        // connection immediately would send a CONNECTION_CLOSE before the
+        // peer has a chance to read the outstanding data.
+        let mut drain_buf = [0u8; 1024];
+        let drain_result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match self.conn.read(&mut drain_buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        if drain_result.is_err() {
+            debug!("Drain timed out — closing connection anyway");
+        }
+
         Ok(())
     }
 
@@ -568,28 +589,36 @@ impl<C: Connection> Session<C> {
             .await
             .with_context(|| format!("failed to read file for sending: {}", path.display()))?;
 
-        let mut data_stream = self.conn.open_stream().await?;
         let total = file_data.len() as u64;
 
-        // Stream in chunks so we can report progress.
-        let chunk_size = 8192;
-        let mut sent: u64 = 0;
-        for chunk in file_data.chunks(chunk_size) {
-            data_stream.write_all(chunk).await?;
-            sent += chunk.len() as u64;
-            emit(
-                &self.event_tx,
-                SessionEvent::TransferProgress {
-                    transfer_id: transfer_id.to_string(),
-                    bytes_transferred: sent,
-                    total_bytes: total,
-                },
-            )
-            .await;
-        }
-        data_stream.shutdown().await?;
+        // For empty files we skip the data stream entirely — some
+        // transports (e.g. yamux) may not reliably deliver a stream
+        // that is opened and immediately closed with zero bytes.
+        if total > 0 {
+            let mut data_stream = self.conn.open_stream().await?;
 
-        info!(transfer_id = %transfer_id, bytes = sent, "File sent");
+            // Stream in chunks so we can report progress.
+            let chunk_size = 8192;
+            let mut sent: u64 = 0;
+            for chunk in file_data.chunks(chunk_size) {
+                data_stream.write_all(chunk).await?;
+                sent += chunk.len() as u64;
+                emit(
+                    &self.event_tx,
+                    SessionEvent::TransferProgress {
+                        transfer_id: transfer_id.to_string(),
+                        bytes_transferred: sent,
+                        total_bytes: total,
+                    },
+                )
+                .await;
+            }
+            data_stream.shutdown().await?;
+
+            info!(transfer_id = %transfer_id, bytes = sent, "File sent");
+        } else {
+            info!(transfer_id = %transfer_id, "Empty file — skipping data stream");
+        }
 
         // Now wait for TRANSFER_DONE from the receiver (handled in main loop).
         // We go back to the select loop; the state is still Transferring.
@@ -598,31 +627,35 @@ impl<C: Connection> Session<C> {
 
     /// Accepts a data stream and reads exactly `size_bytes`.
     async fn receive_file(&mut self, offer: &TransferOfferPayload) -> Result<()> {
-        let mut data_stream = self.conn.accept_stream().await?;
-
         let dest_path = self.receive_dir.join(&offer.filename);
         let mut received: u64 = 0;
         #[allow(clippy::cast_possible_truncation)]
         // file sizes fit in usize on all supported platforms
         let mut file_data = Vec::with_capacity(offer.size_bytes as usize);
 
-        let mut buf = [0u8; 8192];
-        while received < offer.size_bytes {
-            let n = data_stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
+        // For empty files the sender skips the data stream entirely,
+        // so the receiver must not try to accept one.
+        if offer.size_bytes > 0 {
+            let mut data_stream = self.conn.accept_stream().await?;
+
+            let mut buf = [0u8; 8192];
+            while received < offer.size_bytes {
+                let n = data_stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                file_data.extend_from_slice(&buf[..n]);
+                received += n as u64;
+                emit(
+                    &self.event_tx,
+                    SessionEvent::TransferProgress {
+                        transfer_id: offer.transfer_id.clone(),
+                        bytes_transferred: received,
+                        total_bytes: offer.size_bytes,
+                    },
+                )
+                .await;
             }
-            file_data.extend_from_slice(&buf[..n]);
-            received += n as u64;
-            emit(
-                &self.event_tx,
-                SessionEvent::TransferProgress {
-                    transfer_id: offer.transfer_id.clone(),
-                    bytes_transferred: received,
-                    total_bytes: offer.size_bytes,
-                },
-            )
-            .await;
         }
 
         if received != offer.size_bytes {
@@ -1358,5 +1391,879 @@ mod tests {
             ev,
             SessionEvent::Error { .. } | SessionEvent::Finished
         ));
+    }
+
+    // ---------------------------------------------------------------
+    //  Functional tests — end-to-end session scenarios
+    // ---------------------------------------------------------------
+
+    /// Given a completed file transfer, when the receiver finishes writing
+    /// the file, then both sides emit TransferComplete followed by
+    /// Finished without errors.
+    #[tokio::test]
+    async fn given_completed_transfer_when_done_then_both_sides_emit_finished_without_error() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"clean-finish test payload";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let req = SendRequest {
+            transfer_id: "finish-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "out.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "Recv".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "Send".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        // Server: accept the offer.
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "finish-1".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        // Collect ALL client events until Finished.
+        let client_events = collect_events_until(
+            &mut handle_c.event_rx,
+            |e| matches!(e, SessionEvent::Finished),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // There must be TransferComplete and Finished, but NO Error.
+        assert!(
+            client_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TransferComplete { .. })),
+            "client must see TransferComplete"
+        );
+        assert!(
+            client_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Finished)),
+            "client must see Finished"
+        );
+        assert!(
+            !client_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Error { .. })),
+            "client must NOT see any Error, got: {:?}",
+            client_events
+        );
+
+        // Collect ALL server events until Finished.
+        let server_events = collect_events_until(
+            &mut handle_s.event_rx,
+            |e| matches!(e, SessionEvent::Finished),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            server_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TransferComplete { .. })),
+            "server must see TransferComplete"
+        );
+        assert!(
+            server_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Finished)),
+            "server must see Finished"
+        );
+        assert!(
+            !server_events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Error { .. })),
+            "server must NOT see any Error, got: {:?}",
+            server_events
+        );
+
+        // Verify file written correctly.
+        let received = tokio::fs::read(recv_dir.path().join("out.txt"))
+            .await
+            .unwrap();
+        assert_eq!(received, content);
+    }
+
+    /// Given a transfer that is denied, when the client offers again,
+    /// then the second offer succeeds and the file is transferred.
+    #[tokio::test]
+    async fn given_denied_transfer_when_second_offer_sent_then_transfer_succeeds() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"second-attempt data";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        // Wait for handshake.
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+
+        // --- First offer (denied) ---
+        let req1 = SendRequest {
+            transfer_id: "xfer-retry-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "out.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: req1 })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "xfer-retry-1".into(),
+                accept: false,
+            })
+            .await
+            .unwrap();
+
+        let denied = wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::TransferDenied { .. })
+        })
+        .await;
+        assert!(
+            matches!(denied, SessionEvent::TransferDenied { transfer_id } if transfer_id == "xfer-retry-1")
+        );
+
+        // --- Second offer (accepted) ---
+        let req2 = SendRequest {
+            transfer_id: "xfer-retry-2".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "out.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: req2 })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "xfer-retry-2".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        // Both sides complete.
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+
+        let received = tokio::fs::read(recv_dir.path().join("out.txt"))
+            .await
+            .unwrap();
+        assert_eq!(received, content);
+    }
+
+    /// Given a client that drops its command channel, when the session
+    /// detects the close, then it emits Finished cleanly.
+    #[tokio::test]
+    async fn given_client_when_cmd_channel_dropped_then_session_emits_finished() {
+        let (conn_c, conn_s) = MockConnection::pair("c", "s");
+        let dir = make_temp_dir();
+
+        let _handle_s = Session::spawn(conn_s, Role::Server, "S".into(), dir.path().to_path_buf());
+        let mut handle_c =
+            Session::spawn(conn_c, Role::Client, "C".into(), dir.path().to_path_buf());
+
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+
+        // Drop the command sender — the session should detect this and finish.
+        drop(handle_c.cmd_tx);
+
+        let ev = wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Finished)
+        })
+        .await;
+        assert!(matches!(ev, SessionEvent::Finished));
+    }
+
+    /// Given a server that drops its command channel while awaiting a
+    /// decision, then the session emits Finished cleanly.
+    #[tokio::test]
+    async fn given_server_when_cmd_channel_dropped_during_offer_then_session_emits_finished() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"orphan offer";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        let req = SendRequest {
+            transfer_id: "orphan-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "x.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        // Server sees the offer.
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        // Drop the server's command sender without responding.
+        drop(handle_s.cmd_tx);
+
+        let ev = wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::Finished)
+        })
+        .await;
+        assert!(matches!(ev, SessionEvent::Finished));
+
+        // Clean up the client.
+        let _ = handle_c.cmd_tx.send(SessionCmd::Cancel).await;
+    }
+
+    /// Given a zero-byte file, when transferred, then both sides
+    /// complete successfully and the empty file is created.
+    #[tokio::test]
+    async fn given_empty_file_when_transferred_then_both_sides_complete() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        // Create an empty file.
+        tokio::fs::write(send_dir.path().join("send_file.txt"), b"")
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let req = SendRequest {
+            transfer_id: "empty-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "empty.txt".into(),
+            size_bytes: 0,
+            sha256_hex: "n/a".into(),
+        };
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "empty-1".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        // Both sides should complete.
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+
+        // Verify the empty file exists.
+        let received = tokio::fs::read(recv_dir.path().join("empty.txt"))
+            .await
+            .unwrap();
+        assert!(received.is_empty());
+    }
+
+    /// Given a connected session pair, when the client cancels during
+    /// a pending transfer offer, then both sides terminate cleanly.
+    #[tokio::test]
+    async fn given_pending_offer_when_client_cancels_then_both_sessions_terminate() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"cancel-me";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        let req = SendRequest {
+            transfer_id: "cancel-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "x.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+
+        // Client: send offer.
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        // Server: wait for the offer to arrive.
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        // Client: cancel before the server responds.
+        handle_c.cmd_tx.send(SessionCmd::Cancel).await.unwrap();
+
+        let ev = wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Finished)
+        })
+        .await;
+        assert!(matches!(ev, SessionEvent::Finished));
+
+        // The server should also terminate (it will see an error or
+        // connection-closed from the peer).
+        let ev_s = wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::Finished | SessionEvent::Error { .. })
+        })
+        .await;
+        assert!(matches!(
+            ev_s,
+            SessionEvent::Finished | SessionEvent::Error { .. }
+        ));
+    }
+
+    /// Given multiple sequential transfers on the same session, when
+    /// the first is denied and the second accepted, then the second
+    /// file is received correctly (session reuse).
+    #[tokio::test]
+    async fn given_sequential_deny_then_accept_when_same_session_then_second_file_received() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content_a = b"payload A";
+        let content_b = b"payload B - different content";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content_a)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+
+        // --- First: offer, deny ---
+        let req_a = SendRequest {
+            transfer_id: "seq-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "a.txt".into(),
+            size_bytes: content_a.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: req_a })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "seq-1".into(),
+                accept: false,
+            })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::TransferDenied { .. })
+        })
+        .await;
+
+        // --- Second: new file, accept ---
+        // Overwrite the send file with new content.
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content_b as &[u8])
+            .await
+            .unwrap();
+
+        let req_b = SendRequest {
+            transfer_id: "seq-2".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "b.txt".into(),
+            size_bytes: content_b.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: req_b })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "seq-2".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferComplete { .. })
+        })
+        .await;
+
+        let received = tokio::fs::read(recv_dir.path().join("b.txt"))
+            .await
+            .unwrap();
+        assert_eq!(received, content_b);
+    }
+
+    /// Given a large (256 KB) file transfer, when accepted, then
+    /// multiple progress events are emitted on both sides and data
+    /// arrives intact.
+    #[tokio::test]
+    async fn given_256kb_file_when_transferred_then_progress_events_on_both_sides_and_data_intact()
+    {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let content: Vec<u8> = (0..262_144u32).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(send_dir.path().join("send_file.txt"), &content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let req = SendRequest {
+            transfer_id: "big-256k".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "big256k.bin".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "big-256k".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        // Collect client events.
+        let c_events = collect_events_until(
+            &mut handle_c.event_rx,
+            |e| matches!(e, SessionEvent::TransferComplete { .. }),
+            Duration::from_secs(15),
+        )
+        .await;
+
+        let c_progress = c_events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::TransferProgress { .. }))
+            .count();
+        assert!(
+            c_progress >= 2,
+            "expected at least 2 progress events on client, got {c_progress}"
+        );
+
+        // Collect server events.
+        let s_events = collect_events_until(
+            &mut handle_s.event_rx,
+            |e| matches!(e, SessionEvent::TransferComplete { .. }),
+            Duration::from_secs(15),
+        )
+        .await;
+
+        let s_progress = s_events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::TransferProgress { .. }))
+            .count();
+        assert!(
+            s_progress >= 2,
+            "expected at least 2 progress events on server, got {s_progress}"
+        );
+
+        let received = tokio::fs::read(recv_dir.path().join("big256k.bin"))
+            .await
+            .unwrap();
+        assert_eq!(received.len(), content.len());
+        assert_eq!(received, content);
+    }
+
+    /// Given a handshake that completes successfully, then both sides
+    /// report the correct peer device name.
+    #[tokio::test]
+    async fn given_handshake_when_completed_then_peer_names_are_correct() {
+        let (conn_c, conn_s) = MockConnection::pair("c", "s");
+        let dir = make_temp_dir();
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "MyServer".into(),
+            dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "MyClient".into(),
+            dir.path().to_path_buf(),
+        );
+
+        let ev_c = wait_for_event(&mut handle_c.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+        let SessionEvent::Connected {
+            peer_device_name: client_sees,
+        } = ev_c
+        else {
+            unreachable!()
+        };
+        assert_eq!(client_sees, "MyServer");
+
+        let ev_s = wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::Connected { .. })
+        })
+        .await;
+        let SessionEvent::Connected {
+            peer_device_name: server_sees,
+        } = ev_s
+        else {
+            unreachable!()
+        };
+        assert_eq!(server_sees, "MyClient");
+
+        let _ = handle_c.cmd_tx.send(SessionCmd::Cancel).await;
+        let _ = handle_s.cmd_tx.send(SessionCmd::Cancel).await;
+    }
+
+    /// Given a transfer offer, when accepted, then the client receives
+    /// TransferAccepted before any TransferProgress events.
+    #[tokio::test]
+    async fn given_accepted_offer_when_transfer_starts_then_client_sees_accepted_before_progress() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"order-test payload with enough bytes to generate progress";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let req = SendRequest {
+            transfer_id: "order-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "order.txt".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let mut handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+        handle_s
+            .cmd_tx
+            .send(SessionCmd::RespondToOffer {
+                transfer_id: "order-1".into(),
+                accept: true,
+            })
+            .await
+            .unwrap();
+
+        // Collect all client events until TransferComplete.
+        let events = collect_events_until(
+            &mut handle_c.event_rx,
+            |e| matches!(e, SessionEvent::TransferComplete { .. }),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // Find the positions of TransferAccepted and first TransferProgress.
+        let accepted_pos = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TransferAccepted { .. }));
+        let first_progress_pos = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TransferProgress { .. }));
+
+        assert!(accepted_pos.is_some(), "must see TransferAccepted");
+        if let Some(progress_pos) = first_progress_pos {
+            assert!(
+                accepted_pos.unwrap() < progress_pos,
+                "TransferAccepted (pos {:?}) must come before first TransferProgress (pos {progress_pos})",
+                accepted_pos
+            );
+        }
+    }
+
+    /// Given a transfer offer, when the server sees TransferOffered, the
+    /// event contains the correct filename and size.
+    #[tokio::test]
+    async fn given_transfer_offer_when_server_sees_event_then_filename_and_size_match() {
+        let send_dir = make_temp_dir();
+        let recv_dir = make_temp_dir();
+
+        let content = b"metadata check content";
+        tokio::fs::write(send_dir.path().join("send_file.txt"), content)
+            .await
+            .unwrap();
+
+        let (conn_c, conn_s) = MockConnection::pair("sender", "receiver");
+
+        let req = SendRequest {
+            transfer_id: "meta-1".into(),
+            file_path: send_dir.path().join("send_file.txt"),
+            filename: "my_doc.pdf".into(),
+            size_bytes: content.len() as u64,
+            sha256_hex: "n/a".into(),
+        };
+
+        let mut handle_s = Session::spawn(
+            conn_s,
+            Role::Server,
+            "S".into(),
+            recv_dir.path().to_path_buf(),
+        );
+        let handle_c = Session::spawn(
+            conn_c,
+            Role::Client,
+            "C".into(),
+            send_dir.path().to_path_buf(),
+        );
+
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req })
+            .await
+            .unwrap();
+
+        let ev = wait_for_event(&mut handle_s.event_rx, |e| {
+            matches!(e, SessionEvent::TransferOffered { .. })
+        })
+        .await;
+
+        let SessionEvent::TransferOffered {
+            transfer_id,
+            filename,
+            size_bytes,
+        } = ev
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(transfer_id, "meta-1");
+        assert_eq!(filename, "my_doc.pdf");
+        assert_eq!(size_bytes, content.len() as u64);
+
+        let _ = handle_c.cmd_tx.send(SessionCmd::Cancel).await;
+        let _ = handle_s.cmd_tx.send(SessionCmd::Cancel).await;
     }
 }

@@ -190,7 +190,7 @@ async fn run_engine_loop<F, K>(
                                 });
 
                                 if let Some(send_request) = send_request {
-                                    handle.cmd_tx.send(SessionCmd::Transfer { req: send_request }).await;
+                                    let _ = handle.cmd_tx.send(SessionCmd::Transfer { req: send_request }).await;
                                 }
 
                                 sessions.push((sid, ActiveSession {
