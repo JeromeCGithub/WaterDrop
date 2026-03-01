@@ -23,9 +23,6 @@ const OFF_LENGTH: usize = 9;
 pub enum MessageType {
     Hello = 0x01,
     HelloAck = 0x02,
-    PairWithCode = 0x10,
-    PairWithPassword = 0x11,
-    PairResult = 0x12,
     TransferOffer = 0x20,
     TransferDecision = 0x21,
     TransferDone = 0x30,
@@ -39,9 +36,6 @@ impl TryFrom<u8> for MessageType {
         match value {
             0x01 => Ok(Self::Hello),
             0x02 => Ok(Self::HelloAck),
-            0x10 => Ok(Self::PairWithCode),
-            0x11 => Ok(Self::PairWithPassword),
-            0x12 => Ok(Self::PairResult),
             0x20 => Ok(Self::TransferOffer),
             0x21 => Ok(Self::TransferDecision),
             0x30 => Ok(Self::TransferDone),
@@ -168,9 +162,7 @@ pub fn encode_frame_to_bytes(msg_type: MessageType, payload: &[u8]) -> BytesMut 
 
 /// Payload for [`MessageType::Hello`] (sender → receiver).
 ///
-/// Identifies the sender device. In v1-MVP (no pairing), only
-/// `device_name` is used — the signature fields are reserved for the
-/// full auth handshake.
+/// Identifies the sender device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloPayload {
     pub device_name: String,
@@ -319,9 +311,6 @@ mod tests {
         let types = [
             (0x01, MessageType::Hello),
             (0x02, MessageType::HelloAck),
-            (0x10, MessageType::PairWithCode),
-            (0x11, MessageType::PairWithPassword),
-            (0x12, MessageType::PairResult),
             (0x20, MessageType::TransferOffer),
             (0x21, MessageType::TransferDecision),
             (0x30, MessageType::TransferDone),
