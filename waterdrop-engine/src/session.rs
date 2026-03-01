@@ -270,7 +270,7 @@ impl<C: Connection> Session<C> {
             loop {
                 match self.conn.read(&mut drain_buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
+                    Ok(_) => {}
                 }
             }
         })
