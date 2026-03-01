@@ -2,7 +2,7 @@
 members = [
     "waterdrop-cli",
     "waterdrop-core",
-    "waterdrop-engine",
+    "waterdrop-engine", "waterdrop-desktop",
 ]
 resolver = "3"
 
@@ -16,3 +16,15 @@ pedantic = { level = "deny", priority = -1 }
 manual_async_fn = "allow"
 
 doc_markdown = "allow"
+
+[profile]
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
