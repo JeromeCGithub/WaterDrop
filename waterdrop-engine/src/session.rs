@@ -26,6 +26,8 @@ use waterdrop_core::transport::{Connection, DataStream};
 /// the protocol state machine.
 #[derive(Debug, Clone)]
 pub enum SessionCmd {
+    /// Transfer a file or directory.
+    Transfer { req: SendRequest },
     /// Respond to a transfer offer.  Only valid while the session is in
     /// [`SessionState::AwaitingUserDecision`].
     RespondToOffer { transfer_id: String, accept: bool },
@@ -148,9 +150,6 @@ pub struct Session<C: Connection> {
     cmd_rx: mpsc::Receiver<SessionCmd>,
     event_tx: mpsc::Sender<SessionEvent>,
     accum: BytesMut,
-    /// Only set for client sessions that want to send a file right after
-    /// the handshake.
-    send_request: Option<SendRequest>,
     /// Where to write received files (server side).
     receive_dir: PathBuf,
 }
@@ -160,13 +159,7 @@ impl<C: Connection> Session<C> {
     ///
     /// Returns a [`SessionHandle`] that the engine / UI uses to drive
     /// the session.
-    pub fn spawn(
-        conn: C,
-        role: Role,
-        device_name: String,
-        send_request: Option<SendRequest>,
-        receive_dir: PathBuf,
-    ) -> SessionHandle {
+    pub fn spawn(conn: C, role: Role, device_name: String, receive_dir: PathBuf) -> SessionHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(64);
 
@@ -178,7 +171,6 @@ impl<C: Connection> Session<C> {
             cmd_rx,
             event_tx,
             accum: BytesMut::with_capacity(8192),
-            send_request,
             receive_dir,
         };
 
@@ -205,12 +197,6 @@ impl<C: Connection> Session<C> {
     async fn run(mut self) -> Result<()> {
         self.do_handshake().await?;
 
-        if self.role == Role::Client
-            && let Some(req) = self.send_request.take()
-        {
-            self.send_transfer_offer(&req).await?;
-        }
-
         let mut read_buf = [0u8; 4096];
 
         loop {
@@ -224,6 +210,9 @@ impl<C: Connection> Session<C> {
                 // UI commands always take priority.
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
+                        Some(SessionCmd::Transfer { req }) => {
+                            self.send_transfer_offer(&req).await?;
+                        }
                         Some(SessionCmd::Cancel) => {
                             info!("Session cancelled by user");
                             self.send_error("cancelled", "user cancelled").await;
@@ -948,14 +937,12 @@ mod tests {
             conn_s,
             Role::Server,
             "ServerDevice".into(),
-            None,
             dir.path().to_path_buf(),
         );
         let mut handle_c = Session::spawn(
             conn_c,
             Role::Client,
             "ClientDevice".into(),
-            None,
             dir.path().to_path_buf(),
         );
 
@@ -987,20 +974,9 @@ mod tests {
         let (conn_c, conn_s) = MockConnection::pair("client", "server");
         let dir = make_temp_dir();
 
-        let handle_s = Session::spawn(
-            conn_s,
-            Role::Server,
-            "S".into(),
-            None,
-            dir.path().to_path_buf(),
-        );
-        let mut handle_c = Session::spawn(
-            conn_c,
-            Role::Client,
-            "C".into(),
-            None,
-            dir.path().to_path_buf(),
-        );
+        let handle_s = Session::spawn(conn_s, Role::Server, "S".into(), dir.path().to_path_buf());
+        let mut handle_c =
+            Session::spawn(conn_c, Role::Client, "C".into(), dir.path().to_path_buf());
 
         // Wait for handshake to complete.
         wait_for_event(&mut handle_c.event_rx, |e| {
@@ -1046,16 +1022,21 @@ mod tests {
             conn_s,
             Role::Server,
             "Receiver".into(),
-            None,
             recv_dir.path().to_path_buf(),
         );
         let mut handle_c = Session::spawn(
             conn_c,
             Role::Client,
             "Sender".into(),
-            Some(send_req),
             send_dir.path().to_path_buf(),
         );
+
+        // Client: send the file.
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: send_req })
+            .await
+            .unwrap();
 
         // Server: wait for TransferOffered.
         let ev = wait_for_event(&mut handle_s.event_rx, |e| {
@@ -1126,16 +1107,21 @@ mod tests {
             conn_s,
             Role::Server,
             "Receiver".into(),
-            None,
             recv_dir.path().to_path_buf(),
         );
         let mut handle_c = Session::spawn(
             conn_c,
             Role::Client,
             "Sender".into(),
-            Some(send_req),
             send_dir.path().to_path_buf(),
         );
+
+        // Client: send the file.
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: send_req })
+            .await
+            .unwrap();
 
         // Server: wait for the offer.
         wait_for_event(&mut handle_s.event_rx, |e| {
@@ -1192,17 +1178,22 @@ mod tests {
         let mut handle_s = Session::spawn(
             conn_s,
             Role::Server,
-            "R".into(),
-            None,
+            "S".into(),
             recv_dir.path().to_path_buf(),
         );
         let mut handle_c = Session::spawn(
             conn_c,
             Role::Client,
-            "S".into(),
-            Some(send_req),
+            "C".into(),
             send_dir.path().to_path_buf(),
         );
+
+        // Client: send the file.
+        handle_c
+            .cmd_tx
+            .send(SessionCmd::Transfer { req: send_req })
+            .await
+            .unwrap();
 
         // Server: accept the offer.
         wait_for_event(&mut handle_s.event_rx, |e| {
@@ -1306,13 +1297,8 @@ mod tests {
         let (mut conn_c, conn_s) = MockConnection::pair("c", "s");
         let dir = make_temp_dir();
 
-        let mut handle_s = Session::spawn(
-            conn_s,
-            Role::Server,
-            "S".into(),
-            None,
-            dir.path().to_path_buf(),
-        );
+        let mut handle_s =
+            Session::spawn(conn_s, Role::Server, "S".into(), dir.path().to_path_buf());
 
         // Send a TransferOffer instead of HELLO.
         let offer = TransferOfferPayload {
@@ -1342,13 +1328,8 @@ mod tests {
         let (conn_c, mut conn_s) = MockConnection::pair("c", "s");
         let dir = make_temp_dir();
 
-        let mut handle_c = Session::spawn(
-            conn_c,
-            Role::Client,
-            "C".into(),
-            None,
-            dir.path().to_path_buf(),
-        );
+        let mut handle_c =
+            Session::spawn(conn_c, Role::Client, "C".into(), dir.path().to_path_buf());
 
         // Manually act as server: read HELLO, send rejecting HELLO_ACK.
         let mut buf = [0u8; 1024];
