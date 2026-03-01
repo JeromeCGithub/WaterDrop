@@ -12,10 +12,6 @@ use std::time::Duration;
 use common::{collect_events_until, make_send_request, tcp_session_pair, wait_for_event};
 use waterdrop_engine::session::{SessionCmd, SessionEvent};
 
-// ---------------------------------------------------------------------------
-//  Handshake
-// ---------------------------------------------------------------------------
-
 /// Given a real TCP connection, when the handshake completes, then both
 /// sides report the correct peer device name.
 #[tokio::test]
@@ -51,10 +47,6 @@ async fn given_tcp_connection_when_handshake_completes_then_peer_names_are_corre
     let _ = hc.cmd_tx.send(SessionCmd::Cancel).await;
     let _ = hs.cmd_tx.send(SessionCmd::Cancel).await;
 }
-
-// ---------------------------------------------------------------------------
-//  Transfer — accept
-// ---------------------------------------------------------------------------
 
 /// Given a real TCP connection, when a file is transferred and accepted,
 /// then both sides emit TransferComplete and Finished without any
@@ -155,10 +147,6 @@ async fn given_tcp_transfer_when_accepted_then_both_sides_complete_without_error
     assert_eq!(received, content);
 }
 
-// ---------------------------------------------------------------------------
-//  Transfer — large file + progress
-// ---------------------------------------------------------------------------
-
 /// Given a real TCP connection, when a 256 KB file is transferred, then
 /// progress events are emitted on both sides and data arrives intact.
 #[tokio::test]
@@ -244,10 +232,6 @@ async fn given_tcp_large_file_when_transferred_then_progress_emitted_and_data_in
     assert_eq!(received, content);
 }
 
-// ---------------------------------------------------------------------------
-//  Transfer — deny
-// ---------------------------------------------------------------------------
-
 /// Given a real TCP connection, when the server denies the transfer,
 /// then the client sees TransferDenied and both sides remain
 /// operational.
@@ -303,10 +287,6 @@ async fn given_tcp_transfer_when_denied_then_client_sees_denied_without_error() 
     let _ = hc.cmd_tx.send(SessionCmd::Cancel).await;
     let _ = hs.cmd_tx.send(SessionCmd::Cancel).await;
 }
-
-// ---------------------------------------------------------------------------
-//  Transfer — empty file
-// ---------------------------------------------------------------------------
 
 /// Given a real TCP connection with an empty file, when transferred,
 /// then both sides complete and the empty file is created.
@@ -383,10 +363,6 @@ async fn given_tcp_empty_file_when_transferred_then_both_sides_complete() {
         .unwrap();
     assert!(received.is_empty());
 }
-
-// ---------------------------------------------------------------------------
-//  Cancellation
-// ---------------------------------------------------------------------------
 
 /// Given a real TCP connection, when the client cancels mid-session,
 /// then both sides terminate without panicking.
