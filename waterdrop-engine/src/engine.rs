@@ -174,20 +174,24 @@ async fn run_engine_loop<F, K>(
                                 let sid = next_session_id;
                                 next_session_id += 1;
 
-                                let _ = events.send(EngineEvent::SessionCreated {
-                                    session_id: sid,
-                                    peer,
-                                });
 
                                 let handle = Session::spawn(
                                     conn,
                                     Role::Client,
                                     config.device_name.clone(),
-                                    send_request,
                                     config.receive_dir.clone(),
                                 );
 
                                 spawn_event_forwarder(sid, handle.event_rx, events.clone());
+
+                                let _ = events.send(EngineEvent::SessionCreated {
+                                    session_id: sid,
+                                    peer,
+                                });
+
+                                if let Some(send_request) = send_request {
+                                    handle.cmd_tx.send(SessionCmd::Transfer { req: send_request }).await;
+                                }
 
                                 sessions.push((sid, ActiveSession {
                                     cmd_tx: handle.cmd_tx,
@@ -256,7 +260,6 @@ async fn run_engine_loop<F, K>(
                             conn,
                             Role::Server,
                             config.device_name.clone(),
-                            None,
                             config.receive_dir.clone(),
                         );
 
