@@ -2,15 +2,14 @@
 
 Status: MVP
 Scope: Linux receiver/sender (headless first), Android receiver/sender, LAN + Tailscale
-Transport: Custom framed protocol over TCP
+Transport: Custom framed protocol over QUIC/TCP
 
 ## Goals
 
 - Simple, implementable MVP protocol for:
-  - Device pairing (code or NAS password)
   - Authenticated file transfer
   - Receiver-controlled acceptance (`auto_accept` or prompt)
-  - Multiple simultaneous transfers (handled via concurrent TCP connections)
+  - Multiple simultaneous transfers (handled via concurrent connections)
 - Works on LAN and Tailscale
 
 ---
@@ -19,8 +18,6 @@ Transport: Custom framed protocol over TCP
 
 - **Sender**: device initiating a file upload.
 - **Receiver**: device that accepts and stores a file in a configured drop directory.
-- **Paired device**: device whose identity public key is stored in the receiver's paired database.
-- **Pairing mode**: time-limited receiver state that allows adding new paired devices.
 - **Transfer**: one offered file, identified by a `transfer_id`.
 
 ---
@@ -35,7 +32,7 @@ Transport: Custom framed protocol over TCP
 
 ## Concurrency model
 
-- **One transfer per TCP connection**.
+- **One transfer per connection**.
 - Receiver MAY accept many inbound connections at the same time and process them concurrently.
 - Each connection corresponds to one `transfer_id`.
 
@@ -74,9 +71,6 @@ All control messages are sent in frames:
 |----------:|-----------------------|--------------------|
 | 0x01      | HELLO                 | Sender -> Receiver |
 | 0x02      | HELLO_ACK             | Receiver -> Sender |
-| 0x10      | PAIR_WITH_CODE        | Sender -> Receiver |
-| 0x11      | PAIR_WITH_PASSWORD    | Sender -> Receiver |
-| 0x12      | PAIR_RESULT           | Receiver -> Sender |
 | 0x20      | TRANSFER_OFFER        | Sender -> Receiver |
 | 0x21      | TRANSFER_DECISION     | Receiver -> Sender |
 | 0x30      | TRANSFER_DONE         | Receiver -> Sender |
@@ -84,116 +78,34 @@ All control messages are sent in frames:
 
 ---
 
-## Identity and authentication
+## Handshake
 
-Each device has a long-term identity keypair:
-- Algorithm: Ed25519
-- `device_id`: computed as a stable fingerprint of the public key (e.g. SHA-256(pubkey) hex truncated).
-
-Receiver stores paired devices:
-- `device_id`
-- `device_name`
-- `device_pubkey`
-
-### MVP authentication handshake
-
-The goal is: receiver only accepts transfers from paired devices, or allows pairing only in pairing mode.
-
-#### HELLO
+### HELLO (0x01)
 
 Sender begins every connection with `HELLO`.
 
 Payload:
 ```json
 {
-  "device_id": "string",
-  "device_name": "string",
-  "timestamp_unix_ms": 0,
-  "nonce_b64": "string",
-  "signature_b64": "string"
+  "device_name": "string"
 }
 ```
 
-Signature:
-- `signature = Sign(sender_identity_sk, nonce || timestamp_unix_ms || device_id)`
-- Receiver verifies signature using stored public key for `device_id`.
+Identifies the sender device by a human-readable name.
 
-#### HELLO_ACK
+### HELLO_ACK (0x02)
 
 Receiver response:
 ```json
 {
   "ok": true,
-  "paired": true
+  "device_name": "string"
 }
 ```
 
 Rules:
-- If `device_id` is already paired and signature validates: `ok=true`
-- If not paired:
-  - `ok=false` unless receiver is in pairing mode
-  - If receiver is in pairing mode: `ok=true` BUT receiver MUST restrict next allowed messages to pairing messages until pairing succeeds.
-
----
-
-## Pairing
-
-Pairing may be enabled by:
-- Linux interactive user (CLI/UI)
-- NAS admin (CLI/env) with TTL
-
-### PAIR_WITH_CODE (0x10)
-
-Used for interactive pairing where receiver displays a short code.
-
-Payload:
-```json
-{
-  "code": "string",
-  "new_device_id": "string",
-  "new_device_name": "string",
-  "new_device_pubkey_b64": "string"
-}
-```
-
-Receiver validates:
-- Pairing mode is enabled and not expired
-- `code` matches receiver's displayed code
-
-If valid:
-- Receiver stores the device as paired.
-
-### PAIR_WITH_PASSWORD (0x11)
-
-Used for NAS/headless pairing.
-
-Payload:
-```json
-{
-  "password": "string",
-  "new_device_id": "string",
-  "new_device_name": "string",
-  "new_device_pubkey_b64": "string"
-}
-```
-
-Receiver validates:
-- Pairing mode enabled and not expired
-- Password matches configured password
-
-If valid:
-- Receiver stores the device as paired.
-
-### PAIR_RESULT (0x12)
-
-Receiver response to either pairing request:
-```json
-{
-  "ok": true
-}
-```
-
-After `ok=true`, receiver SHOULD allow transfers from this device for the remainder of the connection.
+- If the receiver is willing to accept connections: `ok=true`
+- If the receiver wants to reject: `ok=false`, and the sender MUST close the connection.
 
 ---
 
@@ -214,7 +126,6 @@ Payload:
 ```
 
 Receiver behavior:
-- If sender is not paired: respond `ERROR` (or deny).
 - If receiver `auto_accept=true`: accept immediately.
 - If receiver requires user approval: receiver MAY delay responding until user decides, up to a timeout.
 
@@ -277,9 +188,6 @@ Payload:
 Error codes:
 - `bad_frame`
 - `unsupported_version`
-- `not_paired`
-- `pairing_disabled`
-- `pairing_failed`
 - `auth_failed`
 - `transfer_denied`
 - `invalid_filename`

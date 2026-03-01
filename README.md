@@ -1,6 +1,6 @@
 # WaterDrop
 
-> ⚠️ **This project is in early implementation and is not functional yet.** The foundational infrastructure (transport, engine, logging) is in place, but the protocol, authentication, pairing, and file transfer are not implemented. You cannot transfer files with WaterDrop today.
+> ⚠️ **This project is in early implementation.** The foundational infrastructure (transport, engine, logging) and basic file transfer are in place, but the project is still under active development.
 
 A LAN / Tailscale file drop tool (AirDrop-like) for **Linux**, **Android**, and **Windows**.
 
@@ -9,7 +9,7 @@ Send files quickly to a trusted device on your local network or over Tailscale �
 ## Planned Features
 
 - **Fast local transfers** over TCP on LAN or Tailscale
-- **Device pairing** as the security model (code-based or NAS password)
+- **Transfer accept/deny** as the security model — receiver controls what lands on disk
 - **Headless / NAS-friendly** — runs as a Docker container or background process
 - **Desktop UI** planned via [Dioxus](https://dioxuslabs.com/)
 - **Receiver-controlled** — accept/deny transfers interactively, or auto-accept in headless mode
@@ -32,7 +32,7 @@ waterdrop-app ──┘
 | Crate | Role |
 |-------|------|
 | **waterdrop-core** | Shared types — transport traits, protocol primitives, identity helpers, filesystem utilities |
-| **waterdrop-engine** | Runtime logic — TCP transport, engine event loop, session handling, auth, pairing, transfers |
+| **waterdrop-engine** | Runtime logic — QUIC/TCP transport, engine event loop, session handling, transfers |
 | **waterdrop-cli** | Headless binary — starts the engine, logs events, handles Ctrl+C graceful shutdown |
 | **waterdrop-app** | *(planned)* Desktop UI binary with Dioxus |
 
@@ -70,7 +70,7 @@ cargo test --workspace
 
 | Document | Description |
 |----------|-------------|
-| [`doc/project.md`](doc/project.md) | Project goals, pairing model, transport decisions |
+| [`doc/project.md`](doc/project.md) | Project goals, security model, transport decisions |
 | [`doc/architecture.md`](doc/architecture.md) | Workspace structure and crate responsibilities |
 | [`doc/protocol_v1.md`](doc/protocol_v1.md) | Wire protocol v1 specification (frames, messages, auth, transfers) |
 

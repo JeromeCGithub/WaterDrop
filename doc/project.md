@@ -6,19 +6,11 @@ WaterDrop is a LAN/Tailscale file drop tool (AirDrop-like) for **Linux + Android
 - Send files quickly to a trusted device on:
   - Local network (LAN)
   - Tailscale network
-- **Device pairing** is the security model.
+- **Transfer accept/deny** is the security model — the receiver controls what lands on disk.
 - Receiver saves to a configured **drop folder** (NAS-friendly).
 - Can run:
   - as a **Linux desktop app** (UI)
   - as a **headless** process in **Docker/unRAID** (NAS)
-
-## Pairing
-Two pairing methods:
-- **Code pairing (interactive)**: receiver shows a short code; sender enters it.
-- **NAS password pairing (headless)**: sender provides a NAS pairing password (stored hashed on NAS).
-- Pairing should be enabled only temporarily (TTL) to reduce risk.
-
-After pairing, devices are remembered by storing the peer identity public key.
 
 ## Receiving policy
 - Interactive devices: can prompt user to accept/deny each incoming transfer.
