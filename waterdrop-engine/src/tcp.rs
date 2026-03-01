@@ -52,51 +52,22 @@ impl DataStream for TcpDataStream {
 /// A multiplexed TCP connection backed by yamux.
 ///
 /// The first yamux stream is the **control channel** (protocol frames).
-/// Additional streams are opened/accepted on demand for bulk file
+/// The control stream (first yamux sub-stream) is opened eagerly during
+/// connection creation — by [`connect_yamux`] on the client side and by
+/// [`TcpListener::accept`] on the server side — so the connection is
+/// immediately ready for I/O when handed to a [`Session`].
+///
+/// Additional data streams are opened/accepted on demand for bulk file
 /// transfer via [`open_stream`](Connection::open_stream) and
 /// [`accept_stream`](Connection::accept_stream).
 ///
 /// A background driver task continuously polls the [`yamux::Connection`]
 /// so that all streams can make progress concurrently.
 pub struct TcpConnection {
-    mode: yamux::Mode,
-    control: Option<yamux::Stream>,
+    control: yamux::Stream,
     incoming_rx: mpsc::Receiver<yamux::Stream>,
     outbound_tx: mpsc::Sender<oneshot::Sender<anyhow::Result<yamux::Stream>>>,
     peer_addr: String,
-}
-
-impl TcpConnection {
-    /// Lazily establishes the control stream.
-    ///
-    /// - **Server mode** — waits for the first inbound yamux stream opened
-    ///   by the client.
-    /// - **Client mode** — opens a new outbound yamux stream.
-    ///
-    /// This mirrors the QUIC implementation where the control stream is
-    /// established on the first I/O call rather than during `accept()`.
-    async fn ensure_control(&mut self) -> anyhow::Result<()> {
-        if self.control.is_none() {
-            let stream = match self.mode {
-                yamux::Mode::Server => self
-                    .incoming_rx
-                    .recv()
-                    .await
-                    .context("yamux connection closed before control stream was established")?,
-                yamux::Mode::Client => {
-                    let (tx, rx) = oneshot::channel();
-                    self.outbound_tx
-                        .send(tx)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("yamux driver closed"))?;
-                    rx.await
-                        .context("yamux driver dropped the outbound request")??
-                }
-            };
-            self.control = Some(stream);
-        }
-        Ok(())
-    }
 }
 
 impl Connection for TcpConnection {
@@ -111,10 +82,7 @@ impl Connection for TcpConnection {
         buf: &'a mut [u8],
     ) -> impl Future<Output = anyhow::Result<usize>> + Send + 'a {
         async move {
-            self.ensure_control().await?;
             self.control
-                .as_mut()
-                .expect("control stream initialized")
                 .read(buf)
                 .await
                 .context("failed to read from TCP control stream")
@@ -126,10 +94,7 @@ impl Connection for TcpConnection {
         buf: &'a [u8],
     ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
         async move {
-            self.ensure_control().await?;
             self.control
-                .as_mut()
-                .expect("control stream initialized")
                 .write_all(buf)
                 .await
                 .context("failed to write to TCP control stream")
@@ -138,14 +103,10 @@ impl Connection for TcpConnection {
 
     fn shutdown(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send + '_ {
         async move {
-            self.ensure_control().await?;
-            if let Some(ref mut ctrl) = self.control {
-                ctrl.close()
-                    .await
-                    .context("failed to close TCP control stream")
-            } else {
-                Ok(())
-            }
+            self.control
+                .close()
+                .await
+                .context("failed to close TCP control stream")
         }
     }
 
@@ -169,7 +130,6 @@ impl Connection for TcpConnection {
         &mut self,
     ) -> impl Future<Output = anyhow::Result<Self::DataStream>> + Send + '_ {
         async move {
-            self.ensure_control().await?;
             let stream = self
                 .incoming_rx
                 .recv()
@@ -272,9 +232,15 @@ impl Listener for TcpListener {
 
             tokio::spawn(drive_yamux(yamux_conn, incoming_tx, outbound_rx));
 
+            // Wait for the client to open the first yamux stream (control channel).
+            let mut incoming_rx = incoming_rx;
+            let control = incoming_rx
+                .recv()
+                .await
+                .context("yamux connection closed before control stream was established")?;
+
             Ok(TcpConnection {
-                mode: yamux::Mode::Server,
-                control: None,
+                control,
                 incoming_rx,
                 outbound_tx,
                 peer_addr,
@@ -311,8 +277,8 @@ impl ListenerFactory for TcpListenerFactory {
 
 /// Creates a yamux-wrapped TCP client connection.
 ///
-/// Returns a [`TcpConnection`] speaking yamux in [`Mode::Client`](yamux::Mode::Client),
-/// ready for use with the [`Connection`] trait.
+/// Returns a [`TcpConnection`] with the control stream already open,
+/// ready for immediate I/O via the [`Connection`] trait.
 ///
 /// # Errors
 ///
@@ -336,9 +302,18 @@ pub async fn connect_yamux(addr: &str) -> anyhow::Result<TcpConnection> {
 
     tokio::spawn(drive_yamux(yamux_conn, incoming_tx, outbound_rx));
 
+    // Open the first yamux stream (control channel).
+    let (tx, rx) = oneshot::channel();
+    outbound_tx
+        .send(tx)
+        .await
+        .map_err(|_| anyhow::anyhow!("yamux driver closed"))?;
+    let control = rx
+        .await
+        .context("yamux driver dropped the outbound request")??;
+
     Ok(TcpConnection {
-        mode: yamux::Mode::Client,
-        control: None,
+        control,
         incoming_rx,
         outbound_tx,
         peer_addr,

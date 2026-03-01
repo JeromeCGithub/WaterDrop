@@ -9,18 +9,6 @@ use waterdrop_core::transport::{Connection, Connector, DataStream, Listener, Lis
 
 const ALPN_PROTOCOL: &[u8] = b"waterdrop/1";
 
-/// Whether this side of the QUIC connection initiated (client) or
-/// accepted (server) the connection.
-///
-/// This determines how the **control channel** is established:
-/// - **Client** — opens the first bi-directional stream (`open_bi`).
-/// - **Server** — accepts the first bi-directional stream (`accept_bi`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicMode {
-    Client,
-    Server,
-}
-
 /// A bidirectional QUIC sub-stream used for bulk data transfer.
 ///
 /// Wraps a pair of [`quinn::SendStream`] and [`quinn::RecvStream`] opened
@@ -65,13 +53,12 @@ impl DataStream for QuicDataStream {
     }
 }
 
-/// A QUIC connection backed by a single bi-directional stream.
+/// A QUIC connection with an eagerly-established control stream.
 ///
-/// Stream establishment is lazy: the underlying bi-directional stream is
-/// accepted on the first call to [`read`](Connection::read) or
-/// [`write_all`](Connection::write_all), not during
-/// [`accept`](QuicListener::accept).  This mirrors TCP where `accept()`
-/// returns as soon as the handshake completes.
+/// The control stream (first bidirectional QUIC stream) is opened during
+/// connection creation — by [`connect_quic`] on the client side and by
+/// [`QuicListener::accept`] on the server side — so the connection is
+/// immediately ready for I/O when handed to a [`Session`].
 ///
 /// Additional data streams can be opened via [`open_stream`](Connection::open_stream)
 /// or accepted via [`accept_stream`](Connection::accept_stream).  These are
@@ -79,36 +66,13 @@ impl DataStream for QuicDataStream {
 /// without affecting control traffic.
 pub struct QuicConnection {
     connection: quinn::Connection,
-    mode: QuicMode,
     /// Keeps the client-side endpoint alive for the lifetime of the
     /// connection.  Server-side connections set this to `None` because
     /// the [`QuicListener`] already owns the endpoint.
     _endpoint: Option<quinn::Endpoint>,
-    send: Option<quinn::SendStream>,
-    recv: Option<quinn::RecvStream>,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
     peer_addr: String,
-}
-
-impl QuicConnection {
-    async fn ensure_streams(&mut self) -> anyhow::Result<()> {
-        if self.send.is_none() {
-            let (send, recv) = match self.mode {
-                QuicMode::Client => self
-                    .connection
-                    .open_bi()
-                    .await
-                    .context("failed to open bi-directional QUIC stream (client)")?,
-                QuicMode::Server => self
-                    .connection
-                    .accept_bi()
-                    .await
-                    .context("failed to accept bi-directional QUIC stream (server)")?,
-            };
-            self.send = Some(send);
-            self.recv = Some(recv);
-        }
-        Ok(())
-    }
 }
 
 impl Connection for QuicConnection {
@@ -123,10 +87,7 @@ impl Connection for QuicConnection {
         buf: &'a mut [u8],
     ) -> impl Future<Output = anyhow::Result<usize>> + Send + 'a {
         async move {
-            self.ensure_streams().await?;
             self.recv
-                .as_mut()
-                .expect("streams initialized")
                 .read(buf)
                 .await
                 .context("failed to read from QUIC stream")?
@@ -139,10 +100,7 @@ impl Connection for QuicConnection {
         buf: &'a [u8],
     ) -> impl Future<Output = anyhow::Result<()>> + Send + 'a {
         async move {
-            self.ensure_streams().await?;
             self.send
-                .as_mut()
-                .expect("streams initialized")
                 .write_all(buf)
                 .await
                 .context("failed to write to QUIC stream")
@@ -151,11 +109,9 @@ impl Connection for QuicConnection {
 
     fn shutdown(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send + '_ {
         async move {
-            if let Some(ref mut send) = self.send {
-                send.finish().context("failed to finish QUIC send stream")
-            } else {
-                Ok(())
-            }
+            self.send
+                .finish()
+                .context("failed to finish QUIC send stream")
         }
     }
 
@@ -163,7 +119,6 @@ impl Connection for QuicConnection {
         &mut self,
     ) -> impl Future<Output = anyhow::Result<Self::DataStream>> + Send + '_ {
         async move {
-            self.ensure_streams().await?;
             let (send, recv) = self
                 .connection
                 .open_bi()
@@ -177,7 +132,6 @@ impl Connection for QuicConnection {
         &mut self,
     ) -> impl Future<Output = anyhow::Result<Self::DataStream>> + Send + '_ {
         async move {
-            self.ensure_streams().await?;
             let (send, recv) = self
                 .connection
                 .accept_bi()
@@ -216,12 +170,16 @@ impl Listener for QuicListener {
             let peer_addr = connection.remote_address().to_string();
             debug!(peer = %peer_addr, "Accepted QUIC connection");
 
+            let (send, recv) = connection
+                .accept_bi()
+                .await
+                .context("failed to accept control stream from client")?;
+
             Ok(QuicConnection {
                 connection,
-                mode: QuicMode::Server,
                 _endpoint: None,
-                send: None,
-                recv: None,
+                send,
+                recv,
                 peer_addr,
             })
         }
@@ -279,9 +237,8 @@ impl ListenerFactory for QuicListenerFactory {
 
 /// Creates a QUIC client connection to the given address.
 ///
-/// Returns a [`QuicConnection`] in [`QuicMode::Client`], ready for use
-/// with the [`Connection`] trait.  The control channel stream is lazily
-/// opened on the first read/write call.
+/// Returns a [`QuicConnection`] with the control stream already open,
+/// ready for immediate I/O via the [`Connection`] trait.
 ///
 /// # Errors
 ///
@@ -308,12 +265,16 @@ pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
     let peer_addr = connection.remote_address().to_string();
     debug!(peer = %peer_addr, "QUIC client connected");
 
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .context("failed to open control stream")?;
+
     Ok(QuicConnection {
         connection,
-        mode: QuicMode::Client,
         _endpoint: Some(endpoint),
-        send: None,
-        recv: None,
+        send,
+        recv,
         peer_addr,
     })
 }
@@ -324,7 +285,7 @@ pub async fn connect_quic(addr: &str) -> anyhow::Result<QuicConnection> {
 /// A fresh ephemeral endpoint is created for each connection with an
 /// insecure TLS configuration (server certificate verification is
 /// skipped because authentication happens at the WaterDrop protocol
-/// layer via Ed25519 signatures).
+/// layer).
 pub struct QuicConnector;
 
 impl Connector for QuicConnector {
@@ -455,30 +416,28 @@ mod tests {
     async fn given_client_connects_when_accepted_then_peer_address_matches() {
         let factory = QuicListenerFactory::new().unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client_endpoint = make_client_endpoint().unwrap();
+        // Spawn the server side so that accept (which now eagerly waits
+        // for the control stream) can run concurrently with connect_quic.
+        let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut client_conn = connect_quic(&addr).await.unwrap();
+        let client_peer: std::net::SocketAddr = client_conn.peer().parse().unwrap();
 
-        let client_handle = tokio::spawn(async move {
-            let connection = client_endpoint
-                .connect(addr, "localhost")
-                .unwrap()
-                .await
-                .unwrap();
-            let remote = connection.remote_address();
-            let _ = done_rx.await;
-            remote
-        });
+        // Drive the control channel so the server side can complete
+        // (QUIC coalesces the stream header with the first data write).
+        client_conn.write_all(b"ping").await.unwrap();
 
-        let server_conn = listener.accept().await.unwrap();
+        let mut server_conn = server_handle.await.unwrap();
         let server_peer: std::net::SocketAddr = server_conn.peer().parse().unwrap();
 
-        let _ = done_tx.send(());
-        let client_remote = client_handle.await.unwrap();
+        // Drain the ping so the server connection is clean.
+        let mut buf = [0u8; 16];
+        let n = server_conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
 
-        assert_eq!(server_peer.ip(), client_remote.ip());
+        assert_eq!(server_peer.ip(), client_peer.ip());
     }
 
     #[tokio::test]
@@ -578,33 +537,27 @@ mod tests {
     async fn given_two_clients_when_accepted_then_peers_are_distinct() {
         let factory = QuicListenerFactory::new().unwrap();
         let mut listener = factory.bind("127.0.0.1:0").await.unwrap();
-        let addr: std::net::SocketAddr = listener.local_addr().parse().unwrap();
+        let addr = listener.local_addr();
 
-        let client1 = make_client_endpoint().unwrap();
-        let client2 = make_client_endpoint().unwrap();
-
-        let (done_tx1, done_rx1) = tokio::sync::oneshot::channel::<()>();
-        let (done_tx2, done_rx2) = tokio::sync::oneshot::channel::<()>();
-
-        let h1 = tokio::spawn(async move {
-            let _conn = client1.connect(addr, "localhost").unwrap().await.unwrap();
-            let _ = done_rx1.await;
+        // Spawn the server side so that both accepts can run concurrently
+        // with the client connections.
+        let server_handle = tokio::spawn(async move {
+            let conn1 = listener.accept().await.unwrap();
+            let conn2 = listener.accept().await.unwrap();
+            (conn1, conn2)
         });
 
-        let h2 = tokio::spawn(async move {
-            let _conn = client2.connect(addr, "localhost").unwrap().await.unwrap();
-            let _ = done_rx2.await;
-        });
+        // Write data on each control channel to flush the QUIC stream
+        // frames (QUIC coalesces the stream header with the first write).
+        let addr1 = addr.clone();
+        let mut client1 = connect_quic(&addr1).await.unwrap();
+        client1.write_all(b"c1").await.unwrap();
 
-        let conn1 = listener.accept().await.unwrap();
-        let conn2 = listener.accept().await.unwrap();
+        let mut client2 = connect_quic(&addr).await.unwrap();
+        client2.write_all(b"c2").await.unwrap();
 
+        let (conn1, conn2) = server_handle.await.unwrap();
         assert_ne!(conn1.peer(), conn2.peer());
-
-        let _ = done_tx1.send(());
-        let _ = done_tx2.send(());
-        let _ = h1.await;
-        let _ = h2.await;
     }
 
     #[tokio::test]
