@@ -8,17 +8,14 @@
 //! ## Responsibilities
 //!
 //! - **Protocol primitives** — frame format (magic / version / type / length),
-//!   message structs and enums for pairing and file transfer, and JSON payload
+//!   message structs and enums for file transfer, and JSON payload
 //!   encoding/decoding.
 //!
-//! - **Identity & authentication** — device Ed25519 keypair generation,
-//!   `device_id` derivation (public-key fingerprint), and signature helpers.
-//!
-//! - **Persistence models** — paired-device records and configuration model.
+//! - **TLS helpers** — self-signed certificate generation for transport security.
 //!
 //! - **Filesystem helpers** — filename sanitisation, temp-file write with atomic
 //!   rename, and collision rename strategy (e.g. `file (1).ext`).
 
-pub mod transport;
 pub mod protocol;
 pub mod tls;
+pub mod transport;
