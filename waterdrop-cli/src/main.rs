@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use waterdrop_engine::engine::{Engine, EngineCmd, EngineConfig};
-use waterdrop_engine::tcp::{TcpConnector, TcpListenerFactory};
+use waterdrop_engine::quic::{QuicConnector, QuicListenerFactory};
 
 use crate::command::{handle_connect_cmd, handle_pending_offer};
 use crate::event::{PendingOffer, spawn_event_printer};
@@ -39,7 +39,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Tracing goes to stderr so it doesn't mix with the interactive
@@ -67,7 +67,7 @@ async fn main() {
     };
 
     let engine = Engine;
-    let handle = engine.start(TcpListenerFactory, TcpConnector, config);
+    let handle = engine.start(QuicListenerFactory::new()?, QuicConnector, config);
 
     // Subscribe to engine events.
     let events_rx = handle.events_tx.subscribe();
@@ -152,4 +152,5 @@ async fn main() {
     // Give sessions a moment to clean up.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     println!("  Bye! 👋");
+    Ok(())
 }
