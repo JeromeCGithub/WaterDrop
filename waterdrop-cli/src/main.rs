@@ -12,6 +12,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 use waterdrop_engine::engine::{Engine, EngineCmd, EngineConfig};
 use waterdrop_engine::quic::{QuicConnector, QuicListenerFactory};
 
+fn data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("waterdrop")
+}
+
 use crate::command::{handle_connect_cmd, handle_pending_offer};
 use crate::event::{PendingOffer, spawn_event_printer};
 use crate::ui::{print_banner, print_help, print_prompt, read_line};
@@ -36,6 +42,10 @@ struct Args {
     /// Directory where received files are stored.
     #[arg(short, long, default_value = "/tmp/waterdrop")]
     receive_dir: PathBuf,
+
+    /// Directory where TLS certificates and trust data are stored.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -66,8 +76,16 @@ async fn main() -> anyhow::Result<()> {
         receive_dir: args.receive_dir.clone(),
     };
 
+    let base_dir = args.data_dir.unwrap_or_else(data_dir);
+    let cert_dir = base_dir.join("cert");
+    let trust_store = base_dir.join("trusted");
+
     let engine = Engine;
-    let handle = engine.start(QuicListenerFactory::new()?, QuicConnector, config);
+    let handle = engine.start(
+        QuicListenerFactory::new(&cert_dir)?,
+        QuicConnector::new(&trust_store),
+        config,
+    );
 
     // Subscribe to engine events.
     let events_rx = handle.events_tx.subscribe();
