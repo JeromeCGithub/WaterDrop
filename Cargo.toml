@@ -3,29 +3,31 @@ members = [
     "waterdrop-cli",
     "waterdrop-core",
     "waterdrop-engine",
-    "waterdrop-desktop",
+    "waterdrop-ui",
 ]
 resolver = "3"
+
+[workspace.lints.clippy]
+doc_markdown = "allow"
+manual_async_fn = "allow"
+
+[workspace.lints.clippy.all]
+level = "deny"
+priority = -1
+
+[workspace.lints.clippy.pedantic]
+level = "deny"
+priority = -1
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-
-manual_async_fn = "allow"
-
-doc_markdown = "allow"
-
-[profile]
-
-[profile.wasm-dev]
+[profile.android-dev]
 inherits = "dev"
-opt-level = 1
 
 [profile.server-dev]
 inherits = "dev"
 
-[profile.android-dev]
+[profile.wasm-dev]
+opt-level = 1
 inherits = "dev"
