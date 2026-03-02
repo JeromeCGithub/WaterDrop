@@ -1,0 +1,61 @@
+/* WaterDrop UI — minimal overrides (daisyUI handles most styling) */
+
+/* Smooth scrolling */
+html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Remove default body margin */
+body {
+    margin: 0;
+    padding: 0;
+}
+
+/* Subtle fade-in for cards */
+.card {
+    animation: fadeInUp 0.25s ease-out both;
+}
+
+@keyframes fadeInUp {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Stagger animation for device list items */
+.grid > .card:nth-child(1) {
+    animation-delay: 0ms;
+}
+.grid > .card:nth-child(2) {
+    animation-delay: 50ms;
+}
+.grid > .card:nth-child(3) {
+    animation-delay: 100ms;
+}
+.grid > .card:nth-child(4) {
+    animation-delay: 150ms;
+}
+.grid > .card:nth-child(5) {
+    animation-delay: 200ms;
+}
+.grid > .card:nth-child(6) {
+    animation-delay: 250ms;
+}
+.grid > .card:nth-child(7) {
+    animation-delay: 300ms;
+}
+.grid > .card:nth-child(8) {
+    animation-delay: 350ms;
+}
+
+/* Modal backdrop blur */
+.modal-backdrop {
+    backdrop-filter: blur(4px);
+}
