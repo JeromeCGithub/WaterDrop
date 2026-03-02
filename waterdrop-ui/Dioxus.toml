@@ -1,0 +1,12 @@
+[application]
+name = "WaterDrop"
+
+[web.app]
+title = "WaterDrop"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []
