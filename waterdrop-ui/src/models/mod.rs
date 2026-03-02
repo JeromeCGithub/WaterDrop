@@ -1,5 +1,3 @@
 mod device;
-mod transfer;
 
-pub use device::{Device, DeviceType};
-pub use transfer::TransferStatus;
+pub use device::{Device, DeviceList};

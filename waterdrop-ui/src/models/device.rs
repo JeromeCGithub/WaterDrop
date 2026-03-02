@@ -1,42 +1,35 @@
-/// Represents a device discovered on the network or saved by the user.
-/// This struct is the bridge between the UI and the engine.
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+/// Represents a device that the user has manually added.
+/// Devices are persisted to a JSON file and loaded at startup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
+    /// Unique identifier (UUID v4, generated when the device is added).
     pub id: String,
+    /// Human-readable name chosen by the user (e.g. "Jay's MacBook").
     pub name: String,
-    pub ip_address: String,
-    pub device_type: DeviceType,
-    pub is_online: bool,
+    /// IP address or hostname of the device.
+    pub address: String,
+    /// Port the remote WaterDrop instance listens on.
+    pub port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum DeviceType {
-    Phone,
-    Laptop,
-    Desktop,
-    Tablet,
-    Unknown,
-}
+impl Device {
+    /// Returns the `address:port` string used to connect via the engine.
+    #[must_use]
+    pub fn socket_addr(&self) -> String {
+        format!("{}:{}", self.address, self.port)
+    }
 
-impl DeviceType {
+    /// Returns an emoji icon for display purposes.
+    #[must_use]
     pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Phone => "📱",
-            Self::Laptop => "💻",
-            Self::Desktop => "🖥️",
-            Self::Tablet => "📲",
-            Self::Unknown => "❓",
-        }
+        "🖥️"
     }
+}
 
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Phone => "Phone",
-            Self::Laptop => "Laptop",
-            Self::Desktop => "Desktop",
-            Self::Tablet => "Tablet",
-            Self::Unknown => "Unknown",
-        }
-    }
+/// The list of saved devices, serialized as a JSON array.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceList {
+    pub devices: Vec<Device>,
 }
