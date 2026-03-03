@@ -19,7 +19,9 @@ pub struct EngineSender {
     pub cmd_tx: mpsc::Sender<EngineCmd>,
 }
 
-/// The status of a file transfer that the UI can display.
+// ─── Outgoing (send) state ────────────────────────────────────────────
+
+/// The status of an outgoing file transfer that the UI can display.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferState {
     /// No transfer is in progress.
@@ -40,6 +42,62 @@ pub enum TransferState {
     Error { message: String },
 }
 
+// ─── Incoming (receive) state ─────────────────────────────────────────
+
+/// Represents a pending incoming transfer offer from a remote peer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingTransfer {
+    /// Engine session ID — needed to send accept/deny commands.
+    pub session_id: u64,
+    /// Unique transfer identifier from the protocol.
+    pub transfer_id: String,
+    /// The filename the sender wants to deliver.
+    pub filename: String,
+    /// Size of the file in bytes.
+    pub size_bytes: u64,
+    /// Name of the remote peer device (from the HELLO handshake).
+    pub peer_name: String,
+}
+
+/// The status of an incoming file receive that the UI can display.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReceiveState {
+    /// No incoming transfer is happening.
+    Idle,
+    /// An offer has arrived and is waiting for user decision.
+    Offered { incoming: IncomingTransfer },
+    /// The user accepted and data is being received.
+    Receiving {
+        filename: String,
+        bytes_received: u64,
+        total_bytes: u64,
+    },
+    /// The transfer was denied by the user.
+    Denied { filename: String },
+    /// The transfer completed successfully.
+    Done {
+        filename: String,
+        saved_path: PathBuf,
+    },
+    /// Something went wrong during the receive.
+    Error { message: String },
+}
+
+/// Unified event type forwarded from the background event-listener
+/// task to the Dioxus main thread via an mpsc channel.
+///
+/// We use a single channel with two variants so the UI pump loop
+/// stays simple.
+#[derive(Debug, Clone)]
+pub enum BridgeEvent {
+    /// An update to the *outgoing* transfer state.
+    Send(TransferState),
+    /// An update to the *incoming* receive state.
+    Receive(ReceiveState),
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────
+
 /// Generates a unique transfer ID from the current timestamp.
 fn generate_transfer_id() -> String {
     let ts = SystemTime::now()
@@ -49,10 +107,12 @@ fn generate_transfer_id() -> String {
     format!("xfer-{ts}")
 }
 
+// ─── Engine lifecycle ─────────────────────────────────────────────────
+
 /// Starts the WaterDrop engine on the Tokio runtime.
 ///
 /// - Binds a QUIC listener on `listen_addr` so we can also *receive*
-///   files (not exposed in the UI yet, but the engine supports it).
+///   files.
 /// - Returns an [`EngineHandle`] whose `cmd_tx` / `events_tx` let us
 ///   drive and observe the engine.
 ///
@@ -90,6 +150,8 @@ pub fn start_engine(listen_addr: &str) -> anyhow::Result<EngineHandle> {
     info!("Engine started");
     Ok(handle)
 }
+
+// ─── Outgoing: send file ──────────────────────────────────────────────
 
 /// Sends a file to a remote device.
 ///
@@ -138,34 +200,107 @@ pub async fn send_file(
     Ok(())
 }
 
+// ─── Incoming: respond to offer ───────────────────────────────────────
+
+/// Sends an accept or deny response for an incoming transfer offer.
+pub async fn respond_to_offer(
+    cmd_tx: &mpsc::Sender<EngineCmd>,
+    session_id: u64,
+    transfer_id: &str,
+    accept: bool,
+) -> anyhow::Result<()> {
+    use waterdrop_engine::session::SessionCmd;
+
+    cmd_tx
+        .send(EngineCmd::SessionCmd {
+            session_id,
+            cmd: SessionCmd::RespondToOffer {
+                transfer_id: transfer_id.to_string(),
+                accept,
+            },
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send RespondToOffer command: {e}"))?;
+
+    Ok(())
+}
+
+// ─── Event listener ───────────────────────────────────────────────────
+
 /// Spawns a background task that listens for [`EngineEvent`]s and
-/// forwards [`TransferState`] updates through an `mpsc` channel.
+/// forwards [`BridgeEvent`] updates through an `mpsc` channel.
 ///
-/// Returns the receiving end.  The caller (a Dioxus component) should
+/// Returns the receiving end. The caller (a Dioxus component) should
 /// drain it in a `use_future` / loop on the main thread and write
-/// the values into a `Signal<TransferState>`.
+/// the values into the appropriate `Signal`s.
 ///
 /// We use an `mpsc` channel instead of writing directly to a `Signal`
 /// because `Signal` is `!Send` and cannot be moved into `tokio::spawn`.
-pub fn spawn_event_listener(handle: &EngineHandle) -> mpsc::UnboundedReceiver<TransferState> {
+pub fn spawn_event_listener(handle: &EngineHandle) -> mpsc::UnboundedReceiver<BridgeEvent> {
     let mut events_rx = handle.events_tx.subscribe();
-    let (tx, rx) = mpsc::unbounded_channel::<TransferState>();
+    let (tx, rx) = mpsc::unbounded_channel::<BridgeEvent>();
 
     tokio::spawn(async move {
+        // Track peer names per session so we can populate IncomingTransfer.
+        let mut peer_names: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
+        // Track which sessions are inbound (server-side) vs outbound.
+        // An inbound session will see TransferOffered; outbound will see TransferAccepted.
+        // We determine this by whether we see TransferOffered for a session.
+        let mut inbound_sessions: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Track the filename associated with an inbound transfer for progress display.
+        let mut inbound_filenames: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
+
         loop {
             match events_rx.recv().await {
                 Ok(EngineEvent::SessionCreated { session_id, peer }) => {
                     debug!(session_id, peer = %peer, "Session created");
-                    let _ = tx.send(TransferState::Connected { peer_name: peer });
+                    peer_names.insert(session_id, peer.clone());
+                    // For outbound (sender) sessions we emit Connected;
+                    // for inbound we wait for TransferOffered.
+                    let _ = tx.send(BridgeEvent::Send(TransferState::Connected {
+                        peer_name: peer,
+                    }));
                 }
                 Ok(EngineEvent::SessionEvent { session_id, event }) => {
-                    if let Some(state) = session_event_to_state(session_id, event) {
-                        let _ = tx.send(state);
+                    match classify_event(
+                        session_id,
+                        event,
+                        &peer_names,
+                        &mut inbound_sessions,
+                        &mut inbound_filenames,
+                    ) {
+                        EventClassification::Send(state) => {
+                            let _ = tx.send(BridgeEvent::Send(state));
+                        }
+                        EventClassification::Receive(state) => {
+                            let _ = tx.send(BridgeEvent::Receive(state));
+                        }
+                        EventClassification::Both(send_state, recv_state) => {
+                            let _ = tx.send(BridgeEvent::Send(send_state));
+                            let _ = tx.send(BridgeEvent::Receive(recv_state));
+                        }
+                        EventClassification::ReceiveOrSend {
+                            receive,
+                            send,
+                            is_inbound: inbound,
+                        } => {
+                            if inbound {
+                                let _ = tx.send(BridgeEvent::Receive(receive));
+                            } else {
+                                let _ = tx.send(BridgeEvent::Send(send));
+                            }
+                        }
+                        EventClassification::None => {}
                     }
                 }
                 Ok(EngineEvent::Error { message }) => {
                     warn!(error = %message, "Engine error");
-                    let _ = tx.send(TransferState::Error { message });
+                    let _ = tx.send(BridgeEvent::Send(TransferState::Error {
+                        message: message.clone(),
+                    }));
+                    let _ = tx.send(BridgeEvent::Receive(ReceiveState::Error { message }));
                 }
                 Ok(EngineEvent::Accepting { addr }) => {
                     info!(addr = %addr, "Accepting connections");
@@ -187,62 +322,154 @@ pub fn spawn_event_listener(handle: &EngineHandle) -> mpsc::UnboundedReceiver<Tr
     rx
 }
 
-/// Converts a [`SessionEvent`] into an optional [`TransferState`] update.
-///
-/// Returns `None` for events that don't require a UI state change.
-fn session_event_to_state(session_id: u64, event: SessionEvent) -> Option<TransferState> {
+/// Internal classification of engine session events.
+#[allow(dead_code)]
+enum EventClassification {
+    /// This event is relevant to the outgoing (send) flow.
+    Send(TransferState),
+    /// This event is relevant to the incoming (receive) flow.
+    Receive(ReceiveState),
+    /// Emit both (unlikely in practice, but keeps the API complete).
+    Both(TransferState, ReceiveState),
+    /// Could be either depending on whether the session is inbound.
+    ReceiveOrSend {
+        receive: ReceiveState,
+        send: TransferState,
+        is_inbound: bool,
+    },
+    /// No UI update needed.
+    None,
+}
+
+/// Classifies a session event into a send or receive state update.
+fn classify_event(
+    session_id: u64,
+    event: SessionEvent,
+    peer_names: &std::collections::HashMap<u64, String>,
+    inbound_sessions: &mut std::collections::HashSet<u64>,
+    inbound_filenames: &mut std::collections::HashMap<u64, String>,
+) -> EventClassification {
+    let is_inbound = inbound_sessions.contains(&session_id);
+
     match event {
         SessionEvent::Connected { peer_device_name } => {
             info!(session_id, peer = %peer_device_name, "Handshake complete");
-            Some(TransferState::Connected {
-                peer_name: peer_device_name,
+            // Connected can happen for both directions. We already emit
+            // a Send(Connected) from SessionCreated, so skip duplicates
+            // for outbound. For inbound, we don't need to show anything
+            // until TransferOffered arrives.
+            EventClassification::None
+        }
+
+        SessionEvent::TransferOffered {
+            transfer_id,
+            filename,
+            size_bytes,
+        } => {
+            info!(
+                session_id,
+                transfer_id = %transfer_id,
+                filename = %filename,
+                size_bytes,
+                "Incoming transfer offer"
+            );
+            // Mark this session as inbound.
+            inbound_sessions.insert(session_id);
+            inbound_filenames.insert(session_id, filename.clone());
+
+            let peer_name = peer_names
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            EventClassification::Receive(ReceiveState::Offered {
+                incoming: IncomingTransfer {
+                    session_id,
+                    transfer_id,
+                    filename,
+                    size_bytes,
+                    peer_name,
+                },
             })
         }
+
         SessionEvent::TransferAccepted { transfer_id } => {
             debug!(session_id, transfer_id = %transfer_id, "Transfer accepted by peer");
-            // Progress events will follow; keep the current state.
-            None
+            // This is from our outgoing offer being accepted. Progress
+            // events will follow.
+            EventClassification::None
         }
+
         SessionEvent::TransferDenied { transfer_id } => {
             info!(session_id, transfer_id = %transfer_id, "Transfer denied by peer");
-            Some(TransferState::Error {
+            EventClassification::Send(TransferState::Error {
                 message: "Transfer was denied by the remote device".into(),
             })
         }
+
         SessionEvent::TransferProgress {
             transfer_id: _,
             bytes_transferred,
             total_bytes,
-        } => Some(TransferState::Sending {
-            filename: String::new(),
-            bytes_sent: bytes_transferred,
-            total_bytes,
-        }),
+        } => {
+            if is_inbound {
+                let filename = inbound_filenames
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                EventClassification::Receive(ReceiveState::Receiving {
+                    filename,
+                    bytes_received: bytes_transferred,
+                    total_bytes,
+                })
+            } else {
+                EventClassification::Send(TransferState::Sending {
+                    filename: String::new(),
+                    bytes_sent: bytes_transferred,
+                    total_bytes,
+                })
+            }
+        }
+
         SessionEvent::TransferComplete { transfer_id } => {
             info!(session_id, transfer_id = %transfer_id, "Transfer complete");
-            Some(TransferState::Done {
-                filename: transfer_id,
-            })
+            if is_inbound {
+                let filename = inbound_filenames
+                    .remove(&session_id)
+                    .unwrap_or_else(|| transfer_id.clone());
+                let saved_path = storage::receive_dir().join(&filename);
+                EventClassification::Receive(ReceiveState::Done {
+                    filename,
+                    saved_path,
+                })
+            } else {
+                EventClassification::Send(TransferState::Done {
+                    filename: transfer_id,
+                })
+            }
         }
-        SessionEvent::TransferOffered {
-            transfer_id: _,
-            filename,
-            size_bytes: _,
-        } => {
-            // We are the sender UI — we don't handle incoming offers
-            // in this version, but log it for debugging.
-            debug!(session_id, filename = %filename, "Received incoming offer (ignored)");
-            None
-        }
+
         SessionEvent::Error { message } => {
             warn!(session_id, error = %message, "Session error");
-            Some(TransferState::Error { message })
+            let ts = TransferState::Error {
+                message: message.clone(),
+            };
+            let rs = ReceiveState::Error { message };
+            EventClassification::ReceiveOrSend {
+                receive: rs,
+                send: ts,
+                is_inbound,
+            }
         }
+
         SessionEvent::Finished => {
             debug!(session_id, "Session finished");
-            // Return None — we don't want to overwrite Done/Error with Idle.
-            // The UI can reset to Idle when the user dismisses the modal.
-            None
+            // Clean up tracking state.
+            inbound_sessions.remove(&session_id);
+            inbound_filenames.remove(&session_id);
+            // Don't overwrite Done/Error with Idle — the UI resets
+            // when the user dismisses the modal.
+            EventClassification::None
         }
     }
 }
